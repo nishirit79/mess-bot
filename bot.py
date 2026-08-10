@@ -8,7 +8,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT  # ← এই লাইন যোগ করুন
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 import io
 
 # ============ ডেটাবেস পাথ ============
@@ -536,20 +536,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
         await query.edit_message_text("📂 **মেস পরিবর্তন করুন:**", reply_markup=InlineKeyboardMarkup(keyboard))
     
-    elif data.startswith('pdf_report_'):
-        mess_id = int(data.replace('pdf_report_', ''))
-        await query.edit_message_text("⏳ **PDF রিপোর্ট তৈরি হচ্ছে...** দয়া করে অপেক্ষা করুন।")
-        try:
-            pdf_buffer = generate_pdf_report(mess_id)
-            await query.message.reply_document(
-                document=pdf_buffer,
-                filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
-                caption=f"📄 মেস #{mess_id} এর ফাইনাল রিপোর্ট"
-            )
-            await query.delete_message()
-        except Exception as e:
-            await query.edit_message_text(f"❌ PDF তৈরি করতে সমস্যা হয়েছে: {str(e)}")
-    
     elif data.startswith('add_user_'):
         mess_id = int(data.replace('add_user_', ''))
         if is_mess_completed(mess_id):
@@ -597,6 +583,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('history_'):
         mess_id = int(data.replace('history_', ''))
         await show_history(query, mess_id)
+    
+    elif data.startswith('pdf_report_'):
+        mess_id = int(data.replace('pdf_report_', ''))
+        await query.edit_message_text("⏳ **PDF রিপোর্ট তৈরি হচ্ছে...** দয়া করে অপেক্ষা করুন।")
+        try:
+            pdf_buffer = generate_pdf_report(mess_id)
+            await query.message.reply_document(
+                document=pdf_buffer,
+                filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                caption=f"📄 মেস #{mess_id} এর ফাইনাল রিপোর্ট"
+            )
+            await query.delete_message()
+        except Exception as e:
+            await query.edit_message_text(f"❌ PDF তৈরি করতে সমস্যা হয়েছে: {str(e)}")
     
     elif data.startswith('end_mess_'):
         mess_id = int(data.replace('end_mess_', ''))
