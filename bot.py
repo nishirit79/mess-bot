@@ -52,7 +52,7 @@ def init_db():
     # ইউজার টেবিল
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
+        username TEXT UNIQUE,
         full_name TEXT,
         mess_id INTEGER,
         added_date TEXT
