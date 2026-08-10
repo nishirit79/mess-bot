@@ -16,16 +16,13 @@ DB_PATH = '/app/data/mess.db' if os.path.exists('/app/data') else 'mess.db'
 
 # ============ ডেটাবেস ফাংশন ============
 def init_db():
-    """ডেটাবেস টেবিল তৈরি/আপডেট"""
     os.makedirs(os.path.dirname(DB_PATH) if '/' in DB_PATH else '.', exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # mess_settings টেবিলের কলাম চেক
     c.execute("PRAGMA table_info(mess_settings)")
     columns = [col[1] for col in c.fetchall()]
     
-    # টেবিল না থাকলে তৈরি করুন
     if not columns:
         c.execute('''CREATE TABLE mess_settings (
             key TEXT PRIMARY KEY,
@@ -36,29 +33,23 @@ def init_db():
         )''')
         columns = ['key', 'value', 'start_date', 'end_date', 'month_name']
     
-    # নতুন কলাম যোগ করুন (যদি না থাকে)
     if 'start_date' not in columns:
         c.execute("ALTER TABLE mess_settings ADD COLUMN start_date TEXT")
-        print("✅ start_date কলাম যোগ করা হয়েছে")
     
     if 'end_date' not in columns:
         c.execute("ALTER TABLE mess_settings ADD COLUMN end_date TEXT")
-        print("✅ end_date কলাম যোগ করা হয়েছে")
     
     if 'month_name' not in columns:
         c.execute("ALTER TABLE mess_settings ADD COLUMN month_name TEXT")
-        print("✅ month_name কলাম যোগ করা হয়েছে")
     
-    # ইউজার টেবিল
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
+        username TEXT,
         full_name TEXT,
         mess_id INTEGER,
         added_date TEXT
     )''')
     
-    # ডিপোজিট টেবিল
     c.execute('''CREATE TABLE IF NOT EXISTS deposits (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT,
@@ -68,7 +59,6 @@ def init_db():
         mess_id INTEGER
     )''')
     
-    # খরচ টেবিল
     c.execute('''CREATE TABLE IF NOT EXISTS expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         description TEXT,
@@ -80,7 +70,6 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print("✅ ডেটাবেস প্রস্তুত!")
 
 def get_setting(key):
     conn = sqlite3.connect(DB_PATH)
@@ -120,9 +109,8 @@ def get_mess_info(mess_id):
                 'month_name': result[2] or 'অজানা'
             }
         return None
-    except sqlite3.OperationalError:
+    except:
         conn.close()
-        init_db()
         return None
 
 def save_mess_info(mess_id, start_date, end_date, month_name):
@@ -167,7 +155,7 @@ def add_user(username, mess_id, full_name=None):
                  (username, full_name or username, mess_id, datetime.now().strftime("%Y-%m-%d %H:%M")))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except:
         return False
     finally:
         conn.close()
@@ -287,7 +275,6 @@ def complete_mess(mess_id, end_date):
     if info:
         save_mess_info(mess_id, info['start_date'], end_date, info['month_name'])
 
-# ============ PDF জেনারেটর ============
 def generate_pdf_report(mess_id):
     mess_info = get_mess_info(mess_id)
     users = get_users(mess_id)
@@ -317,7 +304,6 @@ def generate_pdf_report(mess_id):
     story.append(Paragraph(f"<b>জেনারেট:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}", info_style))
     story.append(Spacer(1, 20))
     
-    # ইউজার ডিপোজিট টেবিল
     story.append(Paragraph("<b>👥 ইউজার ভাইস ডিপোজিট</b>", styles['Heading3']))
     story.append(Spacer(1, 10))
     
@@ -340,7 +326,6 @@ def generate_pdf_report(mess_id):
     story.append(user_table)
     story.append(Spacer(1, 20))
     
-    # সামারি
     story.append(Paragraph("<b>📊 সারাংশ</b>", styles['Heading3']))
     story.append(Spacer(1, 10))
     
@@ -406,13 +391,6 @@ def generate_pdf_report(mess_id):
             ('FONTSIZE', (0, 1), (-1, -1), 9)
         ]))
         story.append(deposit_table)
-    
-    if len(expenses) > 20:
-        story.append(Spacer(1, 20))
-        story.append(Paragraph(f"<i>📊 মোট {len(expenses)}টি খরচ আছে। বিস্তারিত টেলিগ্রামে দেখুন।</i>", styles['Normal']))
-    
-    if len(deposits) > 20:
-        story.append(Paragraph(f"<i>📊 মোট {len(deposits)}টি ডিপোজিট আছে। বিস্তারিত টেলিগ্রামে দেখুন।</i>", styles['Normal']))
     
     story.append(Spacer(1, 30))
     story.append(Paragraph(f"<i>জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>", styles['Normal']))
