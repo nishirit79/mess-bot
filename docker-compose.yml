@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  mess-bot:
+    build: .
+    container_name: telegram_mess_bot
+    restart: always
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - TZ=Asia/Dhaka
+    volumes:
+      - ./data:/app/data
