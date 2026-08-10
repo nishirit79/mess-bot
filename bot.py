@@ -35,10 +35,8 @@ def init_db():
     
     if 'start_date' not in columns:
         c.execute("ALTER TABLE mess_settings ADD COLUMN start_date TEXT")
-    
     if 'end_date' not in columns:
         c.execute("ALTER TABLE mess_settings ADD COLUMN end_date TEXT")
-    
     if 'month_name' not in columns:
         c.execute("ALTER TABLE mess_settings ADD COLUMN month_name TEXT")
     
