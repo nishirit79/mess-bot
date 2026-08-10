@@ -3,28 +3,53 @@ import sqlite3
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from reportlab.lib.pagesizes import letter, A4
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.enums import TA_CENTER
 import io
 
 # ============ ডেটাবেস পাথ ============
 DB_PATH = '/app/data/mess.db' if os.path.exists('/app/data') else 'mess.db'
 
+# ============ ডেটাবেস ফাংশন ============
 def init_db():
-    """ডেটাবেস টেবিল তৈরি"""
+    """ডেটাবেস টেবিল তৈরি/আপডেট"""
     os.makedirs(os.path.dirname(DB_PATH) if '/' in DB_PATH else '.', exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    c.execute('''CREATE TABLE IF NOT EXISTS mess_settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )''')
+    # mess_settings টেবিলের কলাম চেক
+    c.execute("PRAGMA table_info(mess_settings)")
+    columns = [col[1] for col in c.fetchall()]
     
+    # টেবিল না থাকলে তৈরি করুন
+    if not columns:
+        c.execute('''CREATE TABLE mess_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            start_date TEXT,
+            end_date TEXT,
+            month_name TEXT
+        )''')
+        columns = ['key', 'value', 'start_date', 'end_date', 'month_name']
+    
+    # নতুন কলাম যোগ করুন (যদি না থাকে)
+    if 'start_date' not in columns:
+        c.execute("ALTER TABLE mess_settings ADD COLUMN start_date TEXT")
+        print("✅ start_date কলাম যোগ করা হয়েছে")
+    
+    if 'end_date' not in columns:
+        c.execute("ALTER TABLE mess_settings ADD COLUMN end_date TEXT")
+        print("✅ end_date কলাম যোগ করা হয়েছে")
+    
+    if 'month_name' not in columns:
+        c.execute("ALTER TABLE mess_settings ADD COLUMN month_name TEXT")
+        print("✅ month_name কলাম যোগ করা হয়েছে")
+    
+    # ইউজার টেবিল
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT,
@@ -33,6 +58,7 @@ def init_db():
         added_date TEXT
     )''')
     
+    # ডিপোজিট টেবিল
     c.execute('''CREATE TABLE IF NOT EXISTS deposits (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT,
@@ -42,6 +68,7 @@ def init_db():
         mess_id INTEGER
     )''')
     
+    # খরচ টেবিল
     c.execute('''CREATE TABLE IF NOT EXISTS expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         description TEXT,
@@ -53,8 +80,8 @@ def init_db():
     
     conn.commit()
     conn.close()
+    print("✅ ডেটাবেস প্রস্তুত!")
 
-# ============ হেল্পার ফাংশন (পূর্বের মতো) ============
 def get_setting(key):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -82,39 +109,45 @@ def set_current_mess_id(mess_id):
 def get_mess_info(mess_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT start_date, end_date, month_name FROM mess_settings WHERE key = ?", (f'mess_{mess_id}_info',))
-    result = c.fetchone()
-    conn.close()
-    if result:
-        return {
-            'start_date': result[0], 
-            'end_date': result[1] or 'চলমান',
-            'month_name': result[2]
-        }
-    return None
+    try:
+        c.execute("SELECT start_date, end_date, month_name FROM mess_settings WHERE key = ?", (f'mess_{mess_id}_info',))
+        result = c.fetchone()
+        conn.close()
+        if result:
+            return {
+                'start_date': result[0] or 'অজানা',
+                'end_date': result[1] or 'চলমান',
+                'month_name': result[2] or 'অজানা'
+            }
+        return None
+    except sqlite3.OperationalError:
+        conn.close()
+        init_db()
+        return None
 
 def save_mess_info(mess_id, start_date, end_date, month_name):
-    set_setting(f'mess_{mess_id}_info', f'{start_date}|{end_date}|{month_name}')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO mess_settings (key, value, start_date, end_date, month_name) VALUES (?, ?, ?, ?, ?)", 
+              (f'mess_{mess_id}_info', f'{start_date}|{end_date}|{month_name}', start_date, end_date, month_name))
+    conn.commit()
+    conn.close()
 
 def get_all_messes():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT key, value FROM mess_settings WHERE key LIKE 'mess_%_info'")
+    c.execute("SELECT key, start_date, end_date, month_name FROM mess_settings WHERE key LIKE 'mess_%_info'")
     results = c.fetchall()
     conn.close()
     
     messes = []
-    for key, value in results:
+    for key, start_date, end_date, month_name in results:
         mess_id = key.split('_')[1]
-        parts = value.split('|')
-        start_date = parts[0]
-        end_date = parts[1] if len(parts) > 1 else 'চলমান'
-        month_name = parts[2] if len(parts) > 2 else 'অজানা'
         messes.append({
             'id': int(mess_id),
-            'start_date': start_date,
-            'end_date': end_date,
-            'month_name': month_name
+            'start_date': start_date or 'অজানা',
+            'end_date': end_date or 'চলমান',
+            'month_name': month_name or 'অজানা'
         })
     return sorted(messes, key=lambda x: x['id'], reverse=True)
 
@@ -256,7 +289,6 @@ def complete_mess(mess_id, end_date):
 
 # ============ PDF জেনারেটর ============
 def generate_pdf_report(mess_id):
-    """PDF রিপোর্ট তৈরি করে"""
     mess_info = get_mess_info(mess_id)
     users = get_users(mess_id)
     
@@ -270,34 +302,15 @@ def generate_pdf_report(mess_id):
     total_exp = sum(e[1] for e in expenses)
     balance = total_dep - total_exp
     
-    # PDF তৈরি
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72)
     styles = getSampleStyleSheet()
     story = []
     
-    # টাইটেল
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=24,
-        textColor=colors.darkblue,
-        alignment=TA_CENTER,
-        spaceAfter=30
-    )
-    
+    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=24, textColor=colors.darkblue, alignment=TA_CENTER, spaceAfter=30)
     story.append(Paragraph("📄 মেসের ফাইনাল রিপোর্ট", title_style))
     
-    # মেস ইনফো
-    info_style = ParagraphStyle(
-        'InfoStyle',
-        parent=styles['Normal'],
-        fontSize=12,
-        textColor=colors.black,
-        alignment=TA_LEFT,
-        spaceAfter=6
-    )
-    
+    info_style = ParagraphStyle('InfoStyle', parent=styles['Normal'], fontSize=12, textColor=colors.black, alignment=TA_LEFT, spaceAfter=6)
     story.append(Paragraph(f"<b>মেস নম্বর:</b> #{mess_id}", info_style))
     story.append(Paragraph(f"<b>মাস:</b> {mess_info['month_name']}", info_style))
     story.append(Paragraph(f"<b>সময়কাল:</b> {start_date} থেকে {end_date}", info_style))
@@ -353,15 +366,12 @@ def generate_pdf_report(mess_id):
     story.append(summary_table)
     story.append(Spacer(1, 20))
     
-    # খরচের বিস্তারিত (যদি ২০টির কম হয়)
     if expenses and len(expenses) <= 20:
         story.append(Paragraph("<b>📋 খরচের বিস্তারিত</b>", styles['Heading3']))
         story.append(Spacer(1, 10))
-        
         expense_data = [["বিবরণ", "পরিমাণ (টাকা)", "তারিখ", "যোগকারী"]]
         for desc, amount, date, added_by in expenses:
             expense_data.append([desc, f"{amount:.2f}", date[:10], f"@{added_by}"])
-        
         expense_table = Table(expense_data, colWidths=[2*inch, 1.2*inch, 1.5*inch, 1.2*inch])
         expense_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.darkred),
@@ -376,16 +386,13 @@ def generate_pdf_report(mess_id):
         ]))
         story.append(expense_table)
     
-    # ডিপোজিটের বিস্তারিত (যদি ২০টির কম হয়)
     if deposits and len(deposits) <= 20:
         story.append(Spacer(1, 20))
         story.append(Paragraph("<b>💰 ডিপোজিটের বিস্তারিত</b>", styles['Heading3']))
         story.append(Spacer(1, 10))
-        
         deposit_data = [["ইউজার", "পরিমাণ (টাকা)", "তারিখ", "নোট"]]
         for username, amount, date, note in deposits:
             deposit_data.append([f"@{username}", f"{amount:.2f}", date[:10], note or "-"])
-        
         deposit_table = Table(deposit_data, colWidths=[1.5*inch, 1.2*inch, 1.5*inch, 1.5*inch])
         deposit_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
@@ -400,7 +407,6 @@ def generate_pdf_report(mess_id):
         ]))
         story.append(deposit_table)
     
-    # যদি বেশি ডেটা থাকে
     if len(expenses) > 20:
         story.append(Spacer(1, 20))
         story.append(Paragraph(f"<i>📊 মোট {len(expenses)}টি খরচ আছে। বিস্তারিত টেলিগ্রামে দেখুন।</i>", styles['Normal']))
@@ -408,12 +414,10 @@ def generate_pdf_report(mess_id):
     if len(deposits) > 20:
         story.append(Paragraph(f"<i>📊 মোট {len(deposits)}টি ডিপোজিট আছে। বিস্তারিত টেলিগ্রামে দেখুন।</i>", styles['Normal']))
     
-    # ফুটার
     story.append(Spacer(1, 30))
     story.append(Paragraph(f"<i>জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>", styles['Normal']))
     story.append(Paragraph("<i>© মেসের হিসাব বট</i>", styles['Normal']))
     
-    # PDF বিল্ড
     doc.build(story)
     buffer.seek(0)
     return buffer
@@ -449,12 +453,12 @@ async def new_mess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📅 **মেস শুরুর তারিখ লিখুন** (যেমন: 2026-01-01):")
     else:
         await update.message.reply_text("📅 **মেস শুরুর তারিখ লিখুন** (যেমন: 2026-01-01):")
-    
     context.user_data['action'] = 'new_mess_date'
 
 async def show_main_menu(message, mess_id):
     mess_info = get_mess_info(mess_id)
     if not mess_info:
+        await message.reply_text("❌ মেস তথ্য পাওয়া যায়নি! /start দিয়ে নতুন শুরু করুন।")
         return
     
     is_completed = is_mess_completed(mess_id)
@@ -501,7 +505,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not messes:
             await query.edit_message_text("📭 কোনো পুরাতন মেস নেই। /start দিয়ে নতুন শুরু করুন।")
             return
-        
         keyboard = []
         for mess in messes:
             status = "✅" if mess['end_date'] != 'চলমান' else "🟢"
@@ -510,11 +513,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f'switch_mess_{mess["id"]}'
             )])
         keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data='back_start')])
-        
-        await query.edit_message_text(
-            "📋 **পুরাতন মেসসমূহ:**\n\nনিচ থেকে একটি বেছে নিন:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await query.edit_message_text("📋 **পুরাতন মেসসমূহ:**\n\nনিচ থেকে একটি বেছে নিন:", reply_markup=InlineKeyboardMarkup(keyboard))
     
     elif data.startswith('switch_mess_'):
         mess_id = int(data.replace('switch_mess_', ''))
@@ -535,17 +534,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f'switch_mess_{mess["id"]}'
             )])
         keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
-        
-        await query.edit_message_text(
-            "📂 **মেস পরিবর্তন করুন:**",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await query.edit_message_text("📂 **মেস পরিবর্তন করুন:**", reply_markup=InlineKeyboardMarkup(keyboard))
     
-    # PDF রিপোর্ট
     elif data.startswith('pdf_report_'):
         mess_id = int(data.replace('pdf_report_', ''))
         await query.edit_message_text("⏳ **PDF রিপোর্ট তৈরি হচ্ছে...** দয়া করে অপেক্ষা করুন।")
-        
         try:
             pdf_buffer = generate_pdf_report(mess_id)
             await query.message.reply_document(
@@ -553,11 +546,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
                 caption=f"📄 মেস #{mess_id} এর ফাইনাল রিপোর্ট"
             )
-            await query.delete_message()  # "তৈরি হচ্ছে" মেসেজ ডিলিট
+            await query.delete_message()
         except Exception as e:
             await query.edit_message_text(f"❌ PDF তৈরি করতে সমস্যা হয়েছে: {str(e)}")
     
-    # অন্যান্য হ্যান্ডলার (পূর্বের মতো)
     elif data.startswith('add_user_'):
         mess_id = int(data.replace('add_user_', ''))
         if is_mess_completed(mess_id):
@@ -575,16 +567,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not users:
             await query.edit_message_text("❌ কোনো ইউজার নেই! আগে ইউজার যোগ করুন।")
             return
-        
         keyboard = []
         for username, full_name in users:
             keyboard.append([InlineKeyboardButton(f"@{username}", callback_data=f'deposit_user_{mess_id}_{username}')])
         keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data=f'back_main_{mess_id}')])
-        
-        await query.edit_message_text(
-            "👤 **কে ডিপোজিট করবেন?**",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await query.edit_message_text("👤 **কে ডিপোজিট করবেন?**", reply_markup=InlineKeyboardMarkup(keyboard))
     
     elif data.startswith('deposit_user_'):
         parts = data.split('_')
@@ -613,10 +600,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith('end_mess_'):
         mess_id = int(data.replace('end_mess_', ''))
-        await query.edit_message_text(
-            "📅 **মেস শেষ করার তারিখ লিখুন** (যেমন: 2026-01-31):\n\n"
-            "⚠️ মনে রাখবেন: একবার শেষ করলে আর ডিপোজিট/খরচ যোগ করা যাবে না!"
-        )
+        await query.edit_message_text("📅 **মেস শেষ করার তারিখ লিখুন** (যেমন: 2026-01-31):\n\n⚠️ মনে রাখবেন: একবার শেষ করলে আর ডিপোজিট/খরচ যোগ করা যাবে না!")
         context.user_data['action'] = f'end_mess_{mess_id}'
     
     elif data.startswith('back_main_'):
@@ -629,6 +613,10 @@ async def show_summary(query, mess_id):
     total_exp = get_total_expenses(mess_id)
     balance = get_balance(mess_id)
     mess_info = get_mess_info(mess_id)
+    
+    if not mess_info:
+        await query.edit_message_text("❌ মেস তথ্য পাওয়া যায়নি!")
+        return
     
     text = f"📊 **মেসের সারাংশ**\n"
     text += f"🆔 মেস #{mess_id}\n"
@@ -685,7 +673,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not action:
         return
     
-    # নতুন মেস শুরু
     if action == 'new_mess_date':
         try:
             start_date = text
@@ -699,13 +686,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == 'new_mess_month':
         month_name = text
         start_date = context.user_data['new_mess_date']
-        
         mess_id = get_next_mess_id()
         save_mess_info(mess_id, start_date, 'চলমান', month_name)
         set_current_mess_id(mess_id)
-        
         context.user_data['action'] = None
-        
         await update.message.reply_text(
             f"✅ **নতুন মেস শুরু হয়েছে!**\n\n"
             f"🆔 মেস নম্বর: #{mess_id}\n"
@@ -716,7 +700,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await show_main_menu(update.message, mess_id)
     
-    # মেস শেষ
     elif action.startswith('end_mess_'):
         mess_id = int(action.replace('end_mess_', ''))
         try:
@@ -724,17 +707,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             datetime.strptime(end_date, "%Y-%m-%d")
             complete_mess(mess_id, end_date)
             context.user_data['action'] = None
-            
-            await update.message.reply_text(
-                f"✅ **মেস #{mess_id} সম্পন্ন হয়েছে!**\n"
-                f"📅 শেষ তারিখ: {end_date}\n\n"
-                f"ফাইনাল রিপোর্ট দেখতে '📄 ফাইনাল রিপোর্ট (PDF)' বাটনে ক্লিক করুন।"
-            )
+            await update.message.reply_text(f"✅ **মেস #{mess_id} সম্পন্ন হয়েছে!**\n📅 শেষ তারিখ: {end_date}\n\nফাইনাল রিপোর্ট দেখতে '📄 ফাইনাল রিপোর্ট (PDF)' বাটনে ক্লিক করুন।")
             await show_main_menu(update.message, mess_id)
         except ValueError:
             await update.message.reply_text("❌ ভুল ফরম্যাট! তারিখটি YYYY-MM-DD ফরম্যাটে দিন।")
     
-    # ইউজার যোগ
     elif action.startswith('add_user_'):
         mess_id = int(action.replace('add_user_', ''))
         username = text.replace('@', '').strip()
@@ -745,24 +722,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['action'] = None
         await show_main_menu(update.message, mess_id)
     
-    # ডিপোজিট
     elif action.startswith('deposit_amount_'):
         mess_id = int(action.replace('deposit_amount_', ''))
         try:
             amount = float(text)
             username = context.user_data.get('deposit_user')
             add_deposit(username, amount, mess_id)
-            
-            await update.message.reply_text(
-                f"✅ @{username} এর {amount:.2f} টাকা ডিপোজিট হয়েছে!\n"
-                f"💰 বর্তমান ব্যালেন্স: {get_balance(mess_id):.2f} টাকা"
-            )
+            await update.message.reply_text(f"✅ @{username} এর {amount:.2f} টাকা ডিপোজিট হয়েছে!\n💰 বর্তমান ব্যালেন্স: {get_balance(mess_id):.2f} টাকা")
             context.user_data['action'] = None
             await show_main_menu(update.message, mess_id)
         except ValueError:
             await update.message.reply_text("❌ দয়া করে সঠিক সংখ্যা দিন!")
     
-    # খরচ
     elif action.startswith('expense_desc_'):
         mess_id = int(action.replace('expense_desc_', ''))
         context.user_data['expense_desc'] = text
@@ -776,11 +747,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = float(text)
             desc = context.user_data.get('expense_desc')
             add_expense(desc, amount, mess_id, update.message.from_user.username or "User")
-            
-            await update.message.reply_text(
-                f"✅ '{desc}' খরচ {amount:.2f} টাকা যোগ হয়েছে!\n"
-                f"💰 বর্তমান ব্যালেন্স: {get_balance(mess_id):.2f} টাকা"
-            )
+            await update.message.reply_text(f"✅ '{desc}' খরচ {amount:.2f} টাকা যোগ হয়েছে!\n💰 বর্তমান ব্যালেন্স: {get_balance(mess_id):.2f} টাকা")
             context.user_data['action'] = None
             await show_main_menu(update.message, mess_id)
         except ValueError:
@@ -789,16 +756,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ মেইন ফাংশন ============
 def main():
     init_db()
-    
     TOKEN = os.environ.get('BOT_TOKEN') or "YOUR_BOT_TOKEN_HERE"
-    
     app = Application.builder().token(TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new_mess))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    
     print("🤖 বট চালু হয়েছে...")
     app.run_polling()
 
