@@ -406,6 +406,10 @@ def complete_mess(mess_id, end_date):
         save_mess_info(mess_id, info['start_date'], end_date, info['month_name'])
 
 def generate_pdf_report(mess_id):
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib.fonts import addMapping
+    
     mess_info = get_mess_info(mess_id)
     users = get_users(mess_id)
     
@@ -420,116 +424,154 @@ def generate_pdf_report(mess_id):
     balance = total_dep - total_exp
     
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72)
+    
+    # PDF ডকুমেন্ট তৈরি
+    doc = SimpleDocTemplate(
+        buffer, 
+        pagesize=A4, 
+        rightMargin=50, 
+        leftMargin=50, 
+        topMargin=50, 
+        bottomMargin=50
+    )
+    
     styles = getSampleStyleSheet()
     story = []
     
-    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=24, textColor=colors.darkblue, alignment=TA_CENTER, spaceAfter=30)
-    story.append(Paragraph("📄 মেসের ফাইনাল রিপোর্ট", title_style))
-    
-    info_style = ParagraphStyle('InfoStyle', parent=styles['Normal'], fontSize=12, textColor=colors.black, alignment=TA_LEFT, spaceAfter=6)
-    story.append(Paragraph(f"<b>মেস নম্বর:</b> #{mess_id}", info_style))
-    story.append(Paragraph(f"<b>মাস:</b> {mess_info['month_name']}", info_style))
-    story.append(Paragraph(f"<b>সময়কাল:</b> {start_date} থেকে {end_date}", info_style))
-    story.append(Paragraph(f"<b>জেনারেট:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}", info_style))
-    story.append(Spacer(1, 20))
-    
-    story.append(Paragraph("<b>👥 ইউজার ভাইস ডিপোজিট</b>", styles['Heading3']))
+    # টাইটেল
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=20,
+        textColor=colors.darkblue,
+        alignment=TA_CENTER,
+        spaceAfter=20,
+        fontName='Helvetica-Bold'
+    )
+    story.append(Paragraph("MESS REPORT", title_style))
     story.append(Spacer(1, 10))
     
-    user_data = [["ইউজারনেম", "ডিপোজিট (টাকা)"]]
+    # মেস ইনফো
+    info_style = ParagraphStyle(
+        'InfoStyle',
+        parent=styles['Normal'],
+        fontSize=12,
+        textColor=colors.black,
+        alignment=TA_LEFT,
+        spaceAfter=6
+    )
+    story.append(Paragraph(f"<b>Mess ID:</b> #{mess_id}", info_style))
+    story.append(Paragraph(f"<b>Month:</b> {mess_info['month_name']}", info_style))
+    story.append(Paragraph(f"<b>Period:</b> {start_date} to {end_date}", info_style))
+    story.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}", info_style))
+    story.append(Spacer(1, 20))
+    
+    # ইউজার ডিপোজিট টেবিল
+    story.append(Paragraph("<b>User Deposits</b>", styles['Heading3']))
+    story.append(Spacer(1, 10))
+    
+    user_data = [["Username", "Deposit (Tk)"]]
+    total_user_dep = 0
     for username, full_name in users:
         dep = get_user_deposits_with_date(username, mess_id, start_date, end_date)
         user_data.append([f"@{username}", f"{dep:.2f}"])
+        total_user_dep += dep
+    
+    # মোট সারি যোগ
+    if users:
+        user_data.append(["TOTAL", f"{total_user_dep:.2f}"])
     
     user_table = Table(user_data, colWidths=[2.5*inch, 2*inch])
     user_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a5276')),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
         ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 12),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ('FONTSIZE', (0, 0), (-1, 0), 11),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+        ('BACKGROUND', (0, 1), (-1, -2), colors.HexColor('#eaf2f8')),
+        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#d4e6f1')),
+        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.HexColor('#f7f9fa'), colors.HexColor('#eaf2f8')])
     ]))
     story.append(user_table)
     story.append(Spacer(1, 20))
     
-    story.append(Paragraph("<b>📊 সারাংশ</b>", styles['Heading3']))
+    # সারাংশ টেবিল
+    story.append(Paragraph("<b>Summary</b>", styles['Heading3']))
     story.append(Spacer(1, 10))
     
     summary_data = [
-        ["বিবরণ", "পরিমাণ (টাকা)"],
-        ["মোট ডিপোজিট", f"{total_dep:.2f}"],
-        ["মোট খরচ", f"{total_exp:.2f}"],
-        ["অবশিষ্ট", f"{balance:.2f}"]
+        ["Description", "Amount (Tk)"],
+        ["Total Deposit", f"{total_dep:.2f}"],
+        ["Total Expense", f"{total_exp:.2f}"],
+        ["Balance", f"{balance:.2f}"]
     ]
+    
+    # ব্যালেন্সের রঙ
+    balance_color = colors.HexColor('#27ae60') if balance >= 0 else colors.HexColor('#e74c3c')
     
     summary_table = Table(summary_data, colWidths=[2.5*inch, 2*inch])
     summary_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.darkgreen),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e8449')),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
         ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 12),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -2), colors.lightgrey),
-        ('BACKGROUND', (0, -1), (-1, -1), colors.yellow),
+        ('FONTSIZE', (0, 0), (-1, 0), 11),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+        ('BACKGROUND', (0, 1), (-1, -2), colors.HexColor('#e8f8f5')),
+        ('BACKGROUND', (0, -1), (-1, -1), balance_color),
+        ('TEXTCOLOR', (0, -1), (-1, -1), colors.whitesmoke),
+        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
         ('GRID', (0, 0), (-1, -1), 1, colors.black)
     ]))
     story.append(summary_table)
     story.append(Spacer(1, 20))
     
+    # খরচের বিস্তারিত
     if expenses and len(expenses) <= 20:
-        story.append(Paragraph("<b>📋 খরচের বিস্তারিত</b>", styles['Heading3']))
+        story.append(Paragraph("<b>Expense Details</b>", styles['Heading3']))
         story.append(Spacer(1, 10))
-        expense_data = [["বিবরণ", "পরিমাণ (টাকা)", "তারিখ", "যোগকারী"]]
+        expense_data = [["Description", "Amount (Tk)", "Date", "Added By"]]
         for desc, amount, date, added_by in expenses:
             expense_data.append([desc, f"{amount:.2f}", date[:10], f"@{added_by}"])
-        expense_table = Table(expense_data, colWidths=[2*inch, 1.2*inch, 1.5*inch, 1.2*inch])
+        
+        expense_table = Table(expense_data, colWidths=[1.8*inch, 1.2*inch, 1.5*inch, 1.2*inch])
         expense_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.darkred),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#922b21')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.lightgrey),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#fdedec')),
             ('GRID', (0, 0), (-1, -1), 1, colors.black),
             ('FONTSIZE', (0, 1), (-1, -1), 9)
         ]))
         story.append(expense_table)
     
-    if deposits and len(deposits) <= 20:
-        story.append(Spacer(1, 20))
-        story.append(Paragraph("<b>💰 ডিপোজিটের বিস্তারিত</b>", styles['Heading3']))
+    if len(expenses) > 20:
         story.append(Spacer(1, 10))
-        deposit_data = [["ইউজার", "পরিমাণ (টাকা)", "তারিখ", "নোট"]]
-        for username, amount, date, note in deposits:
-            deposit_data.append([f"@{username}", f"{amount:.2f}", date[:10], note or "-"])
-        deposit_table = Table(deposit_data, colWidths=[1.5*inch, 1.2*inch, 1.5*inch, 1.5*inch])
-        deposit_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.lightgrey),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ('FONTSIZE', (0, 1), (-1, -1), 9)
-        ]))
-        story.append(deposit_table)
+        story.append(Paragraph(f"<i>Total {len(expenses)} expenses. View details in Telegram.</i>", styles['Normal']))
     
+    # ফুটার
     story.append(Spacer(1, 30))
-    story.append(Paragraph(f"<i>জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>", styles['Normal']))
-    story.append(Paragraph("<i>© মেসের হিসাব বট</i>", styles['Normal']))
+    footer_style = ParagraphStyle(
+        'Footer',
+        parent=styles['Normal'],
+        fontSize=9,
+        textColor=colors.grey,
+        alignment=TA_CENTER
+    )
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", footer_style))
+    story.append(Paragraph("© Mess Accounting Bot", footer_style))
     
+    # PDF বিল্ড
     doc.build(story)
     buffer.seek(0)
     return buffer
-
+    
 # ============ টেলিগ্রাম হ্যান্ডলার ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
