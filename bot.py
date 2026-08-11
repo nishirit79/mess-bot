@@ -198,6 +198,14 @@ def get_user_messes(user_id):
     conn.close()
     return users
 
+def get_users(mess_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username, full_name FROM users WHERE mess_id = ?", (mess_id,))
+    users = c.fetchall()
+    conn.close()
+    return users
+
 def add_user(username, mess_id, full_name=None, user_id=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
