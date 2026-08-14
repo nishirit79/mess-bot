@@ -410,6 +410,28 @@ def generate_pdf_report(mess_id):
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.lib.fonts import addMapping
     
+    # ========== বাংলা ফন্ট রেজিস্টার করুন ==========
+    # ফন্ট ফাইলের পাথ দিন (আপনার ফোল্ডার অনুযায়ী)
+    FONT_PATH = os.path.join(os.path.dirname(__file__), 'fonts', 'SolaimanLipi.ttf')
+    
+    # ফন্ট রেজিস্টার
+    try:
+        if os.path.exists(FONT_PATH):
+            pdfmetrics.registerFont(TTFont('BanglaFont', FONT_PATH))
+            addMapping('BanglaFont', 0, 0, 'BanglaFont')  # normal
+            addMapping('BanglaFont', 1, 0, 'BanglaFont')  # bold
+            print("✅ বাংলা ফন্ট লোড হয়েছে!")
+        else:
+            print(f"⚠️ ফন্ট ফাইল পাওয়া যায়নি: {FONT_PATH}")
+            # ফন্ট না থাকলে ডিফল্ট ব্যবহার করুন
+            BANGLA_FONT = 'Helvetica'
+    except Exception as e:
+        print(f"⚠️ ফন্ট লোড করতে সমস্যা: {e}")
+        BANGLA_FONT = 'Helvetica'
+    
+    # ফন্ট সেট করুন
+    BANGLA_FONT = 'BanglaFont' if os.path.exists(FONT_PATH) else 'Helvetica'
+    
     mess_info = get_mess_info(mess_id)
     users = get_users(mess_id)
     
@@ -425,7 +447,6 @@ def generate_pdf_report(mess_id):
     
     buffer = io.BytesIO()
     
-    # PDF ডকুমেন্ট তৈরি
     doc = SimpleDocTemplate(
         buffer, 
         pagesize=A4, 
@@ -438,6 +459,7 @@ def generate_pdf_report(mess_id):
     styles = getSampleStyleSheet()
     story = []
     
+    # ========== বাংলা ফন্ট দিয়ে স্টাইল তৈরি করুন ==========
     # টাইটেল
     title_style = ParagraphStyle(
         'CustomTitle',
@@ -446,70 +468,77 @@ def generate_pdf_report(mess_id):
         textColor=colors.darkblue,
         alignment=TA_CENTER,
         spaceAfter=20,
-        fontName='Helvetica-Bold'
+        fontName=BANGLA_FONT
     )
-    story.append(Paragraph("MESS REPORT", title_style))
+    story.append(Paragraph("📄 মেস রিপোর্ট", title_style))
     story.append(Spacer(1, 10))
     
-    # মেস ইনফো
+    # ইনফো স্টাইল
     info_style = ParagraphStyle(
         'InfoStyle',
         parent=styles['Normal'],
         fontSize=12,
         textColor=colors.black,
         alignment=TA_LEFT,
-        spaceAfter=6
+        spaceAfter=6,
+        fontName=BANGLA_FONT
     )
-    story.append(Paragraph(f"<b>Mess ID:</b> #{mess_id}", info_style))
-    story.append(Paragraph(f"<b>Month:</b> {mess_info['month_name']}", info_style))
-    story.append(Paragraph(f"<b>Period:</b> {start_date} to {end_date}", info_style))
-    story.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}", info_style))
+    story.append(Paragraph(f"<b>মেস নম্বর:</b> #{mess_id}", info_style))
+    story.append(Paragraph(f"<b>মাস:</b> {mess_info['month_name']}", info_style))
+    story.append(Paragraph(f"<b>সময়কাল:</b> {start_date} থেকে {end_date}", info_style))
+    story.append(Paragraph(f"<b>জেনারেট:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}", info_style))
     story.append(Spacer(1, 20))
     
-    # ইউজার ডিপোজিট টেবিল
-    story.append(Paragraph("<b>User Deposits</b>", styles['Heading3']))
+    # ========== ইউজার ডিপোজিট টেবিল ==========
+    story.append(Paragraph("<b>👥 ইউজার ডিপোজিট</b>", ParagraphStyle(
+        'HeadingStyle',
+        parent=styles['Heading3'],
+        fontName=BANGLA_FONT
+    )))
     story.append(Spacer(1, 10))
     
-    user_data = [["Username", "Deposit (Tk)"]]
+    user_data = [["ইউজারনেম", "ডিপোজিট (টাকা)"]]
     total_user_dep = 0
     for username, full_name in users:
         dep = get_user_deposits_with_date(username, mess_id, start_date, end_date)
         user_data.append([f"@{username}", f"{dep:.2f}"])
         total_user_dep += dep
     
-    # মোট সারি যোগ
     if users:
-        user_data.append(["TOTAL", f"{total_user_dep:.2f}"])
+        user_data.append(["মোট", f"{total_user_dep:.2f}"])
     
     user_table = Table(user_data, colWidths=[2.5*inch, 2*inch])
     user_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a5276')),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 0), (-1, 0), BANGLA_FONT),
         ('FONTSIZE', (0, 0), (-1, 0), 11),
         ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
         ('BACKGROUND', (0, 1), (-1, -2), colors.HexColor('#eaf2f8')),
         ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#d4e6f1')),
-        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (0, -1), (-1, -1), BANGLA_FONT),
         ('GRID', (0, 0), (-1, -1), 1, colors.black),
         ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.HexColor('#f7f9fa'), colors.HexColor('#eaf2f8')])
     ]))
     story.append(user_table)
     story.append(Spacer(1, 20))
     
-    # সারাংশ টেবিল
-    story.append(Paragraph("<b>Summary</b>", styles['Heading3']))
+    # ========== সারাংশ টেবিল ==========
+    story.append(Paragraph("<b>📊 সারাংশ</b>", ParagraphStyle(
+        'HeadingStyle',
+        parent=styles['Heading3'],
+        fontName=BANGLA_FONT
+    )))
     story.append(Spacer(1, 10))
     
     summary_data = [
-        ["Description", "Amount (Tk)"],
-        ["Total Deposit", f"{total_dep:.2f}"],
-        ["Total Expense", f"{total_exp:.2f}"],
-        ["Balance", f"{balance:.2f}"]
+        ["বিবরণ", "পরিমাণ (টাকা)"],
+        ["মোট ডিপোজিট", f"{total_dep:.2f}"],
+        ["মোট খরচ", f"{total_exp:.2f}"],
+        ["ব্যালেন্স", f"{balance:.2f}"]
     ]
     
-    # ব্যালেন্সের রঙ
     balance_color = colors.HexColor('#27ae60') if balance >= 0 else colors.HexColor('#e74c3c')
     
     summary_table = Table(summary_data, colWidths=[2.5*inch, 2*inch])
@@ -517,23 +546,27 @@ def generate_pdf_report(mess_id):
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e8449')),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 0), (-1, 0), BANGLA_FONT),
         ('FONTSIZE', (0, 0), (-1, 0), 11),
         ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
         ('BACKGROUND', (0, 1), (-1, -2), colors.HexColor('#e8f8f5')),
         ('BACKGROUND', (0, -1), (-1, -1), balance_color),
         ('TEXTCOLOR', (0, -1), (-1, -1), colors.whitesmoke),
-        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (0, -1), (-1, -1), BANGLA_FONT),
         ('GRID', (0, 0), (-1, -1), 1, colors.black)
     ]))
     story.append(summary_table)
     story.append(Spacer(1, 20))
     
-    # খরচের বিস্তারিত
+    # ========== খরচের বিস্তারিত ==========
     if expenses and len(expenses) <= 20:
-        story.append(Paragraph("<b>Expense Details</b>", styles['Heading3']))
+        story.append(Paragraph("<b>📋 খরচের বিস্তারিত</b>", ParagraphStyle(
+            'HeadingStyle',
+            parent=styles['Heading3'],
+            fontName=BANGLA_FONT
+        )))
         story.append(Spacer(1, 10))
-        expense_data = [["Description", "Amount (Tk)", "Date", "Added By"]]
+        expense_data = [["বিবরণ", "পরিমাণ (টাকা)", "তারিখ", "যোগকারী"]]
         for desc, amount, date, added_by in expenses:
             expense_data.append([desc, f"{amount:.2f}", date[:10], f"@{added_by}"])
         
@@ -542,32 +575,34 @@ def generate_pdf_report(mess_id):
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#922b21')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (0, 0), (-1, 0), BANGLA_FONT),
             ('FONTSIZE', (0, 0), (-1, 0), 10),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
             ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#fdedec')),
             ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ('FONTSIZE', (0, 1), (-1, -1), 9)
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('FONTNAME', (0, 1), (-1, -1), BANGLA_FONT)
         ]))
         story.append(expense_table)
     
     if len(expenses) > 20:
         story.append(Spacer(1, 10))
-        story.append(Paragraph(f"<i>Total {len(expenses)} expenses. View details in Telegram.</i>", styles['Normal']))
+        story.append(Paragraph(f"<i>মোট {len(expenses)}টি খরচ আছে। বিস্তারিত টেলিগ্রামে দেখুন।</i>", 
+                               ParagraphStyle('Normal', parent=styles['Normal'], fontName=BANGLA_FONT)))
     
-    # ফুটার
+    # ========== ফুটার ==========
     story.append(Spacer(1, 30))
     footer_style = ParagraphStyle(
         'Footer',
         parent=styles['Normal'],
         fontSize=9,
         textColor=colors.grey,
-        alignment=TA_CENTER
+        alignment=TA_CENTER,
+        fontName=BANGLA_FONT
     )
-    story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", footer_style))
-    story.append(Paragraph("© Mess Accounting Bot", footer_style))
+    story.append(Paragraph(f"জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", footer_style))
+    story.append(Paragraph("© মেস অ্যাকাউন্টিং বট", footer_style))
     
-    # PDF বিল্ড
     doc.build(story)
     buffer.seek(0)
     return buffer
