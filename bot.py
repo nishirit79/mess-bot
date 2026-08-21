@@ -21,6 +21,12 @@ _BN_REGULAR = os.path.join(_FONT_DIR, 'HindSiliguri-Regular.ttf')
 _BN_BOLD = os.path.join(_FONT_DIR, 'HindSiliguri-Medium.ttf')
 _BN_FONTS_OK = os.path.exists(_BN_REGULAR) and os.path.exists(_BN_BOLD)
 
+if _BN_FONTS_OK:
+    print(f"✅ বাংলা ফন্ট পাওয়া গেছে: {_FONT_DIR}")
+else:
+    print(f"⚠️⚠️⚠️ বাংলা ফন্ট পাওয়া যায়নি! পাথ চেক করা হয়েছে: {_FONT_DIR}")
+    print(f"⚠️ PDF রিপোর্টে বাংলা টেক্সট বক্স/■ দেখাবে। fonts/HindSiliguri-Regular.ttf ও fonts/HindSiliguri-Medium.ttf রিপোতে আছে কিনা যাচাই করুন।")
+
 def bn_text(text, size=11, bold=False, color=(0, 0, 0)):
     """বাংলা/মিশ্র টেক্সটকে সঠিকভাবে শেপ করে reportlab Image flowable হিসেবে রিটার্ন করে।"""
     if not text:
@@ -562,6 +568,48 @@ def generate_pdf_report(mess_id):
     ]))
     story.append(summary_table)
     story.append(Spacer(1, 20))
+    
+    # ইউজার ভিত্তিক ডিপোজিটের বিস্তারিত (তারিখসহ)
+    if users:
+        story.append(bn_text("ইউজার ভিত্তিক ডিপোজিটের বিস্তারিত", size=13, bold=True))
+        story.append(Spacer(1, 10))
+        
+        deposits_by_user = {}
+        for dep_username, dep_amount, dep_date, dep_note in deposits:
+            deposits_by_user.setdefault(dep_username, []).append((dep_date, dep_amount))
+        
+        for username, full_name in users:
+            user_deps = sorted(deposits_by_user.get(username, []))
+            story.append(bn_text(f"@{username}", size=11, bold=True, color=(26, 82, 118)))
+            story.append(Spacer(1, 4))
+            
+            if user_deps:
+                detail_data = [[bn_text("তারিখ", size=10, bold=True, color=(255, 255, 255)),
+                                 bn_text("পরিমাণ (টাকা)", size=10, bold=True, color=(255, 255, 255))]]
+                user_total = 0
+                for dep_date, dep_amount in user_deps:
+                    detail_data.append([dep_date[:16], f"{dep_amount:.2f}"])
+                    user_total += dep_amount
+                detail_data.append([bn_text("মোট", size=10, bold=True), f"{user_total:.2f}"])
+                
+                detail_table = Table(detail_data, colWidths=[3*inch, 1.5*inch])
+                detail_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2874a6')),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('FONTNAME', (0, 1), (-1, -2), 'Helvetica'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 10),
+                    ('TOPPADDING', (0, 0), (-1, -1), 5),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                    ('BACKGROUND', (0, 1), (-1, -2), colors.HexColor('#eaf2f8')),
+                    ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#d4e6f1')),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                ]))
+                story.append(detail_table)
+            else:
+                story.append(bn_text("(কোনো ডিপোজিট নেই)", size=10, color=(120, 120, 120)))
+            
+            story.append(Spacer(1, 14))
     
     # খরচের বিস্তারিত
     if expenses and len(expenses) <= 20:
