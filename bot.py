@@ -569,6 +569,48 @@ def generate_pdf_report(mess_id):
     story.append(summary_table)
     story.append(Spacer(1, 20))
     
+    # মাথাপিছু হিসাব (কে ফেরত পাবে / কাকে দিতে হবে)
+    if users:
+        story.append(bn_text("মাথাপিছু হিসাব", size=13, bold=True))
+        story.append(Spacer(1, 8))
+        
+        per_head = total_exp / len(users)
+        story.append(bn_text(f"মোট খরচ {total_exp:.2f} টাকা ÷ {len(users)} জন = মাথাপিছু {per_head:.2f} টাকা", size=10, color=(80, 80, 80)))
+        story.append(Spacer(1, 10))
+        
+        settle_data = [[bn_text("ইউজারনেম", size=10, bold=True, color=(255, 255, 255)),
+                        bn_text("জমা দিয়েছে", size=10, bold=True, color=(255, 255, 255)),
+                        bn_text("মাথাপিছু খরচ", size=10, bold=True, color=(255, 255, 255)),
+                        bn_text("ফেরত পাবে / দিতে হবে", size=10, bold=True, color=(255, 255, 255))]]
+        row_colors = []
+        for username, full_name in users:
+            dep = get_user_deposits_with_date(username, mess_id, query_start, query_end)
+            diff = dep - per_head
+            if diff >= 0:
+                diff_text = bn_text(f"+{diff:.2f} (ফেরত পাবে)", size=9, color=(30, 100, 40))
+                row_colors.append(colors.HexColor('#d5f5e3'))
+            else:
+                diff_text = bn_text(f"{diff:.2f} (দিতে হবে)", size=9, color=(150, 30, 30))
+                row_colors.append(colors.HexColor('#fadbd8'))
+            settle_data.append([f"@{username}", f"{dep:.2f}", f"{per_head:.2f}", diff_text])
+        
+        settle_table = Table(settle_data, colWidths=[1.5*inch, 1.2*inch, 1.2*inch, 1.6*inch])
+        settle_style = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6c3483')),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]
+        for i, rc in enumerate(row_colors, start=1):
+            settle_style.append(('BACKGROUND', (0, i), (-1, i), rc))
+        settle_table.setStyle(TableStyle(settle_style))
+        story.append(settle_table)
+        story.append(Spacer(1, 20))
+    
     # ইউজার ভিত্তিক ডিপোজিটের বিস্তারিত (তারিখসহ)
     if users:
         story.append(bn_text("ইউজার ভিত্তিক ডিপোজিটের বিস্তারিত", size=13, bold=True))
@@ -1002,6 +1044,19 @@ def build_summary_text(mess_id):
     
     if balance < 0:
         text += "\n\n⚠️ *সতর্কতা: খরচ ডিপোজিটের চেয়ে বেশি!*"
+    
+    # মাথাপিছু হিসাব — শুধু খরচ ৫০০০ টাকা বা তার বেশি হলে দেখাবে
+    if users and total_exp >= 5000:
+        per_head = total_exp / len(users)
+        text += f"\n\n🧮 **মাথাপিছু হিসাব**\n"
+        text += f"মোট খরচ {total_exp:.2f} ÷ {len(users)} জন = মাথাপিছু {per_head:.2f} টাকা\n"
+        for username, full_name in users:
+            dep = get_user_deposits(username, mess_id)
+            diff = dep - per_head
+            if diff >= 0:
+                text += f"  @{username}: +{diff:.2f} টাকা (ফেরত পাবে)\n"
+            else:
+                text += f"  @{username}: {diff:.2f} টাকা (দিতে হবে)\n"
     
     return text
 
