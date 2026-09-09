@@ -720,7 +720,7 @@ def generate_pdf_report(mess_id):
     story.append(Spacer(1, 30))
     story.append(bn_text(f"জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", size=9, color=(128, 128, 128)))
     story.append(Spacer(1, 3))
-    story.append(bn_text("© মেসের হিসাব বট", size=9, color=(128, 128, 128)))
+    story.append(bn_text("© @mess_accounting_bot", size=9, color=(128, 128, 128)))
     
     # PDF বিল্ড
     doc.build(story)
