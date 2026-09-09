@@ -683,6 +683,39 @@ def generate_pdf_report(mess_id):
         story.append(Spacer(1, 10))
         story.append(bn_text(f"মোট {len(expenses)}টি খরচ। বিস্তারিত টেলিগ্রামে দেখুন।", size=10, color=(80, 80, 80)))
     
+    # প্রতিদিনের খরচ (তারিখ ভিত্তিক মোট)
+    if expenses:
+        story.append(Spacer(1, 20))
+        story.append(bn_text("প্রতিদিনের খরচ", size=13, bold=True))
+        story.append(Spacer(1, 10))
+        
+        daily_totals = {}
+        for desc, amount, date, added_by in expenses:
+            day = date[:10]
+            daily_totals[day] = daily_totals.get(day, 0) + amount
+        
+        daily_data = [[bn_text("তারিখ", size=10, bold=True, color=(255, 255, 255)),
+                       bn_text("মোট খরচ (টাকা)", size=10, bold=True, color=(255, 255, 255))]]
+        for day in sorted(daily_totals.keys()):
+            daily_data.append([day, f"{daily_totals[day]:.2f}"])
+        daily_data.append([bn_text("সর্বমোট", size=10, bold=True), f"{sum(daily_totals.values()):.2f}"])
+        
+        daily_table = Table(daily_data, colWidths=[2.5*inch, 2*inch])
+        daily_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#7d3c98')),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('FONTNAME', (0, 1), (-1, -2), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('BACKGROUND', (0, 1), (-1, -2), colors.HexColor('#f4ecf7')),
+            ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#d7bde2')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.HexColor('#faf5fc'), colors.HexColor('#f4ecf7')])
+        ]))
+        story.append(daily_table)
+    
     # ফুটার
     story.append(Spacer(1, 30))
     story.append(bn_text(f"জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", size=9, color=(128, 128, 128)))
