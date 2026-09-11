@@ -89,6 +89,10 @@ def init_db():
         c.execute("ALTER TABLE mess_settings ADD COLUMN end_date TEXT")
     if 'month_name' not in columns:
         c.execute("ALTER TABLE mess_settings ADD COLUMN month_name TEXT")
+    if 'mess_type' not in columns:
+        c.execute("ALTER TABLE mess_settings ADD COLUMN mess_type TEXT")
+    if 'default_mill_count' not in columns:
+        c.execute("ALTER TABLE mess_settings ADD COLUMN default_mill_count REAL")
     
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,6 +152,24 @@ def init_db():
         current_mess_id INTEGER
     )''')
     
+    c.execute('''CREATE TABLE IF NOT EXISTS mills (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mess_id INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        mill_date TEXT NOT NULL,
+        mill_count REAL NOT NULL DEFAULT 1,
+        UNIQUE(mess_id, username, mill_date)
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS meal_presets (
+        mess_id INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        breakfast REAL NOT NULL DEFAULT 1,
+        lunch REAL NOT NULL DEFAULT 1,
+        dinner REAL NOT NULL DEFAULT 1,
+        PRIMARY KEY (mess_id, username)
+    )''')
+    
     conn.commit()
     conn.close()
 
@@ -185,43 +207,46 @@ def get_mess_info(mess_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute("SELECT start_date, end_date, month_name FROM mess_settings WHERE key = ?", (f'mess_{mess_id}_info',))
+        c.execute("SELECT start_date, end_date, month_name, mess_type, default_mill_count FROM mess_settings WHERE key = ?", (f'mess_{mess_id}_info',))
         result = c.fetchone()
         conn.close()
         if result:
             return {
                 'start_date': result[0] or 'অজানা',
                 'end_date': result[1] or 'চলমান',
-                'month_name': result[2] or 'অজানা'
+                'month_name': result[2] or 'অজানা',
+                'mess_type': result[3] or 'simple',
+                'default_mill_count': result[4] if result[4] is not None else 1.0
             }
         return None
     except:
         conn.close()
         return None
 
-def save_mess_info(mess_id, start_date, end_date, month_name):
+def save_mess_info(mess_id, start_date, end_date, month_name, mess_type='simple', default_mill_count=1.0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO mess_settings (key, value, start_date, end_date, month_name) VALUES (?, ?, ?, ?, ?)", 
-              (f'mess_{mess_id}_info', f'{start_date}|{end_date}|{month_name}', start_date, end_date, month_name))
+    c.execute("INSERT OR REPLACE INTO mess_settings (key, value, start_date, end_date, month_name, mess_type, default_mill_count) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+              (f'mess_{mess_id}_info', f'{start_date}|{end_date}|{month_name}', start_date, end_date, month_name, mess_type, default_mill_count))
     conn.commit()
     conn.close()
 
 def get_all_messes():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT key, start_date, end_date, month_name FROM mess_settings WHERE key LIKE 'mess_%_info'")
+    c.execute("SELECT key, start_date, end_date, month_name, mess_type FROM mess_settings WHERE key LIKE 'mess_%_info'")
     results = c.fetchall()
     conn.close()
     
     messes = []
-    for key, start_date, end_date, month_name in results:
+    for key, start_date, end_date, month_name, mess_type in results:
         mess_id = key.split('_')[1]
         messes.append({
             'id': int(mess_id),
             'start_date': start_date or 'অজানা',
             'end_date': end_date or 'চলমান',
-            'month_name': month_name or 'অজানা'
+            'month_name': month_name or 'অজানা',
+            'mess_type': mess_type or 'simple'
         })
     return sorted(messes, key=lambda x: x['id'], reverse=True)
 
@@ -436,6 +461,118 @@ def get_recent_expenses(mess_id, limit=10):
     conn.close()
     return data
 
+# ============ মিল (Student Mess) সংক্রান্ত ফাংশন ============
+def set_mill(mess_id, username, mill_date, mill_count):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""INSERT INTO mills (mess_id, username, mill_date, mill_count)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(mess_id, username, mill_date)
+                 DO UPDATE SET mill_count = excluded.mill_count""",
+              (mess_id, username, mill_date, mill_count))
+    conn.commit()
+    conn.close()
+
+def bulk_set_mills_for_date(mess_id, mill_date, usernames, defaults, exceptions=None):
+    """defaults: either a single number (same for everyone) or a dict {username: count}
+    (from meal presets). exceptions: dict {username: count} that override defaults for that date."""
+    exceptions = exceptions or {}
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    for username in usernames:
+        if username in exceptions:
+            count = exceptions[username]
+        elif isinstance(defaults, dict):
+            count = defaults.get(username, 1.0)
+        else:
+            count = defaults
+        c.execute("""INSERT INTO mills (mess_id, username, mill_date, mill_count)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT(mess_id, username, mill_date)
+                     DO UPDATE SET mill_count = excluded.mill_count""",
+                  (mess_id, username, mill_date, count))
+    conn.commit()
+    conn.close()
+
+def get_mills_with_date(mess_id, start_date, end_date):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT username, mill_date, mill_count FROM mills
+                 WHERE mess_id = ? AND mill_date >= ? AND mill_date <= ?
+                 ORDER BY mill_date""", (mess_id, start_date, end_date))
+    data = c.fetchall()
+    conn.close()
+    return data
+
+def get_user_mill_total(mess_id, username, start_date, end_date):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT COALESCE(SUM(mill_count), 0) FROM mills
+                 WHERE mess_id = ? AND username = ? AND mill_date >= ? AND mill_date <= ?""",
+              (mess_id, username, start_date, end_date))
+    total = c.fetchone()[0]
+    conn.close()
+    return total
+
+def get_total_mills(mess_id, start_date, end_date):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT COALESCE(SUM(mill_count), 0) FROM mills
+                 WHERE mess_id = ? AND mill_date >= ? AND mill_date <= ?""",
+              (mess_id, start_date, end_date))
+    total = c.fetchone()[0]
+    conn.close()
+    return total
+
+def get_mill_dates_entered(mess_id):
+    """যেসব তারিখে ইতিমধ্যে মিল এন্ট্রি করা হয়েছে (ডুপ্লিকেট এন্ট্রি সতর্কতার জন্য)"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT mill_date FROM mills WHERE mess_id = ?", (mess_id,))
+    dates = {row[0] for row in c.fetchall()}
+    conn.close()
+    return dates
+
+def get_daily_mill_totals(mess_id, start_date, end_date):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT mill_date, SUM(mill_count) FROM mills
+                 WHERE mess_id = ? AND mill_date >= ? AND mill_date <= ?
+                 GROUP BY mill_date ORDER BY mill_date""", (mess_id, start_date, end_date))
+    data = {row[0]: row[1] for row in c.fetchall()}
+    conn.close()
+    return data
+
+# ============ প্রতিদিনের মিল প্রিসেট (সকাল/দুপুর/রাত) ============
+def get_meal_preset(mess_id, username):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT breakfast, lunch, dinner FROM meal_presets WHERE mess_id = ? AND username = ?", (mess_id, username))
+    result = c.fetchone()
+    conn.close()
+    if result:
+        return {'breakfast': result[0], 'lunch': result[1], 'dinner': result[2]}
+    return {'breakfast': 1.0, 'lunch': 1.0, 'dinner': 1.0}  # প্রিসেট সেট না করলে ডিফল্ট ১+১+১
+
+def set_meal_preset(mess_id, username, breakfast, lunch, dinner):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""INSERT INTO meal_presets (mess_id, username, breakfast, lunch, dinner)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(mess_id, username)
+                 DO UPDATE SET breakfast = excluded.breakfast, lunch = excluded.lunch, dinner = excluded.dinner""",
+              (mess_id, username, breakfast, lunch, dinner))
+    conn.commit()
+    conn.close()
+
+def get_preset_total(mess_id, username):
+    p = get_meal_preset(mess_id, username)
+    return p['breakfast'] + p['lunch'] + p['dinner']
+
+def get_daily_default_mills(mess_id, usernames):
+    """প্রতিটা ইউজারের নিজস্ব সকাল+দুপুর+রাত প্রিসেট অনুযায়ী দৈনিক ডিফল্ট মিল সংখ্যা"""
+    return {u: get_preset_total(mess_id, u) for u in usernames}
+
 def get_next_mess_id():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -458,6 +595,7 @@ def complete_mess(mess_id, end_date):
 def generate_pdf_report(mess_id):
     mess_info = get_mess_info(mess_id)
     users = get_users(mess_id)
+    mess_type = mess_info.get('mess_type', 'simple')
     
     start_date = mess_info['start_date']
     end_date = mess_info['end_date'] if mess_info['end_date'] != 'চলমান' else datetime.now().strftime("%Y-%m-%d")
@@ -569,47 +707,141 @@ def generate_pdf_report(mess_id):
     story.append(summary_table)
     story.append(Spacer(1, 20))
     
-    # মাথাপিছু হিসাব (কে ফেরত পাবে / কাকে দিতে হবে)
+    # হিসাব (কে ফেরত পাবে / কাকে দিতে হবে) — mess_type অনুযায়ী মাথাপিছু বা মিল-ভিত্তিক
     if users:
-        story.append(bn_text("মাথাপিছু হিসাব", size=13, bold=True))
-        story.append(Spacer(1, 8))
-        
-        per_head = total_exp / len(users)
-        story.append(bn_text(f"মোট খরচ {total_exp:.2f} টাকা ÷ {len(users)} জন = মাথাপিছু {per_head:.2f} টাকা", size=10, color=(80, 80, 80)))
-        story.append(Spacer(1, 10))
-        
-        settle_data = [[bn_text("ইউজারনেম", size=10, bold=True, color=(255, 255, 255)),
-                        bn_text("জমা দিয়েছে", size=10, bold=True, color=(255, 255, 255)),
-                        bn_text("মাথাপিছু খরচ", size=10, bold=True, color=(255, 255, 255)),
-                        bn_text("ফেরত পাবে / দিতে হবে", size=10, bold=True, color=(255, 255, 255))]]
-        row_colors = []
-        for username, full_name in users:
-            dep = get_user_deposits_with_date(username, mess_id, query_start, query_end)
-            diff = dep - per_head
-            if diff >= 0:
-                diff_text = bn_text(f"+{diff:.2f} (ফেরত পাবে)", size=9, color=(30, 100, 40))
-                row_colors.append(colors.HexColor('#d5f5e3'))
-            else:
-                diff_text = bn_text(f"{diff:.2f} (দিতে হবে)", size=9, color=(150, 30, 30))
-                row_colors.append(colors.HexColor('#fadbd8'))
-            settle_data.append([f"@{username}", f"{dep:.2f}", f"{per_head:.2f}", diff_text])
-        
-        settle_table = Table(settle_data, colWidths=[1.5*inch, 1.2*inch, 1.2*inch, 1.6*inch])
-        settle_style = [
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6c3483')),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 1), (-1, -1), 9),
-            ('TOPPADDING', (0, 0), (-1, -1), 6),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]
-        for i, rc in enumerate(row_colors, start=1):
-            settle_style.append(('BACKGROUND', (0, i), (-1, i), rc))
-        settle_table.setStyle(TableStyle(settle_style))
-        story.append(settle_table)
-        story.append(Spacer(1, 20))
+        if mess_type == 'student':
+            total_mills = get_total_mills(mess_id, start_date, end_date)
+            per_mill = (total_exp / total_mills) if total_mills > 0 else 0
+            story.append(bn_text("মিল হিসাব", size=13, bold=True))
+            story.append(Spacer(1, 8))
+            story.append(bn_text(
+                f"মোট খরচ {total_exp:.2f} টাকা ÷ মোট {total_mills:g} মিল = প্রতি মিল {per_mill:.2f} টাকা",
+                size=10, color=(80, 80, 80)
+            ))
+            story.append(Spacer(1, 10))
+            
+            settle_data = [[bn_text("ইউজারনেম", size=10, bold=True, color=(255, 255, 255)),
+                            bn_text("মোট মিল", size=10, bold=True, color=(255, 255, 255)),
+                            bn_text("জমা দিয়েছে", size=10, bold=True, color=(255, 255, 255)),
+                            bn_text("মিল খরচ", size=10, bold=True, color=(255, 255, 255)),
+                            bn_text("ফেরত পাবে / দিতে হবে", size=9, bold=True, color=(255, 255, 255))]]
+            row_colors = []
+            for username, full_name in users:
+                dep = get_user_deposits_with_date(username, mess_id, query_start, query_end)
+                user_mills = get_user_mill_total(mess_id, username, start_date, end_date)
+                mill_cost = user_mills * per_mill
+                diff = dep - mill_cost
+                if diff >= 0:
+                    diff_text = bn_text(f"+{diff:.2f} (ফেরত পাবে)", size=9, color=(30, 100, 40))
+                    row_colors.append(colors.HexColor('#d5f5e3'))
+                else:
+                    diff_text = bn_text(f"{diff:.2f} (দিতে হবে)", size=9, color=(150, 30, 30))
+                    row_colors.append(colors.HexColor('#fadbd8'))
+                settle_data.append([f"@{username}", f"{user_mills:g}", f"{dep:.2f}", f"{mill_cost:.2f}", diff_text])
+            
+            settle_table = Table(settle_data, colWidths=[1.3*inch, 0.8*inch, 1.1*inch, 1.1*inch, 1.5*inch])
+            settle_style = [
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6c3483')),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 9),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]
+            for i, rc in enumerate(row_colors, start=1):
+                settle_style.append(('BACKGROUND', (0, i), (-1, i), rc))
+            settle_table.setStyle(TableStyle(settle_style))
+            story.append(settle_table)
+            story.append(Spacer(1, 20))
+            
+            # তারিখ-ভিত্তিক মিল ব্রেকডাউন (কে কবে কয়টা মিল খেয়েছে)
+            mill_rows = get_mills_with_date(mess_id, start_date, end_date)
+            if mill_rows:
+                story.append(bn_text("তারিখ ভিত্তিক মিল বিবরণ", size=13, bold=True))
+                story.append(Spacer(1, 10))
+                
+                dates_sorted = sorted({r[1] for r in mill_rows})
+                usernames_sorted = [u for u, _ in users]
+                mill_map = {(u, d): cnt for u, d, cnt in mill_rows}
+                
+                header = [bn_text("তারিখ", size=9, bold=True, color=(255, 255, 255))] + \
+                         [bn_text(f"@{u}", size=9, bold=True, color=(255, 255, 255)) for u in usernames_sorted] + \
+                         [bn_text("দিনের মোট", size=9, bold=True, color=(255, 255, 255))]
+                mill_table_data = [header]
+                for d in dates_sorted:
+                    row = [d]
+                    day_total = 0
+                    for u in usernames_sorted:
+                        cnt = mill_map.get((u, d))
+                        row.append(f"{cnt:g}" if cnt is not None else "-")
+                        day_total += cnt or 0
+                    row.append(bn_text(f"{day_total:g}", size=9, bold=True))
+                    mill_table_data.append(row)
+                total_row = [bn_text("মোট", size=9, bold=True)]
+                for u in usernames_sorted:
+                    total_row.append(f"{get_user_mill_total(mess_id, u, start_date, end_date):g}")
+                total_row.append(bn_text(f"{get_total_mills(mess_id, start_date, end_date):g}", size=9, bold=True))
+                mill_table_data.append(total_row)
+                
+                col_widths = [0.9*inch] + [min(0.8*inch, 4.2*inch/max(len(usernames_sorted),1))]*len(usernames_sorted) + [0.9*inch]
+                mill_table = Table(mill_table_data, colWidths=col_widths)
+                mill_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#117864')),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('BACKGROUND', (0, 1), (-1, -2), colors.HexColor('#e8f6f3')),
+                    ('BACKGROUND', (-1, 1), (-1, -2), colors.HexColor('#d1f2eb')),
+                    ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#a3e4d7')),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.black)
+                ]))
+                story.append(mill_table)
+                story.append(Spacer(1, 20))
+        else:
+            story.append(bn_text("মাথাপিছু হিসাব", size=13, bold=True))
+            story.append(Spacer(1, 8))
+            
+            per_head = total_exp / len(users)
+            story.append(bn_text(f"মোট খরচ {total_exp:.2f} টাকা ÷ {len(users)} জন = মাথাপিছু {per_head:.2f} টাকা", size=10, color=(80, 80, 80)))
+            story.append(Spacer(1, 10))
+            
+            settle_data = [[bn_text("ইউজারনেম", size=10, bold=True, color=(255, 255, 255)),
+                            bn_text("জমা দিয়েছে", size=10, bold=True, color=(255, 255, 255)),
+                            bn_text("মাথাপিছু খরচ", size=10, bold=True, color=(255, 255, 255)),
+                            bn_text("ফেরত পাবে / দিতে হবে", size=10, bold=True, color=(255, 255, 255))]]
+            row_colors = []
+            for username, full_name in users:
+                dep = get_user_deposits_with_date(username, mess_id, query_start, query_end)
+                diff = dep - per_head
+                if diff >= 0:
+                    diff_text = bn_text(f"+{diff:.2f} (ফেরত পাবে)", size=9, color=(30, 100, 40))
+                    row_colors.append(colors.HexColor('#d5f5e3'))
+                else:
+                    diff_text = bn_text(f"{diff:.2f} (দিতে হবে)", size=9, color=(150, 30, 30))
+                    row_colors.append(colors.HexColor('#fadbd8'))
+                settle_data.append([f"@{username}", f"{dep:.2f}", f"{per_head:.2f}", diff_text])
+            
+            settle_table = Table(settle_data, colWidths=[1.5*inch, 1.2*inch, 1.2*inch, 1.6*inch])
+            settle_style = [
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6c3483')),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 9),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]
+            for i, rc in enumerate(row_colors, start=1):
+                settle_style.append(('BACKGROUND', (0, i), (-1, i), rc))
+            settle_table.setStyle(TableStyle(settle_style))
+            story.append(settle_table)
+            story.append(Spacer(1, 20))
     
     # ইউজার ভিত্তিক ডিপোজিটের বিস্তারিত (তারিখসহ)
     if users:
@@ -778,14 +1010,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
+MESS_TYPE_LABELS = {
+    'simple': '🍽️ সাধারণ মেস (মাথাপিছু হিসাব)',
+    'student': '🎓 স্টুডেন্ট মেস (মিল হিসাব)',
+    'personal': '👤 ব্যক্তিগত হিসাব'
+}
+
 async def new_mess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton(MESS_TYPE_LABELS['simple'], callback_data='newmess_type_simple')],
+        [InlineKeyboardButton(MESS_TYPE_LABELS['student'], callback_data='newmess_type_student')],
+        [InlineKeyboardButton(MESS_TYPE_LABELS['personal'], callback_data='newmess_type_personal')]
+    ]
+    text = (
+        "🆕 **নতুন মেস**\n\n"
+        "কী ধরনের হিসাব রাখতে চান?\n\n"
+        "🍽️ সাধারণ মেস — খরচ সবার মধ্যে মাথাপিছু ভাগ হবে\n"
+        "🎓 স্টুডেন্ট মেস — প্রতিদিন কে কয়টা মিল খেলো তার হিসাবে খরচ ভাগ হবে\n"
+        "👤 ব্যক্তিগত হিসাব — শুধু নিজের আয়-ব্যয় ট্র্যাক করার জন্য"
+    )
     query = update.callback_query
     if query:
         await query.answer()
-        await query.edit_message_text("📅 **মেস শুরুর তারিখ লিখুন** (যেমন: 2026-01-01):")
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     else:
-        await update.message.reply_text("📅 **মেস শুরুর তারিখ লিখুন** (যেমন: 2026-01-01):")
-    context.user_data['action'] = 'new_mess_date'
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def show_main_menu(message, mess_id, user_id=None):
     mess_info = get_mess_info(mess_id)
@@ -795,10 +1044,13 @@ async def show_main_menu(message, mess_id, user_id=None):
     
     is_completed = is_mess_completed(mess_id)
     status = "✅ সম্পন্ন" if is_completed else "🟢 চলমান"
+    mess_type = mess_info.get('mess_type', 'simple')
+    type_label = MESS_TYPE_LABELS.get(mess_type, mess_type)
     
     await message.reply_text(
         f"📆 **মেস ইনফো**\n"
         f"🆔 মেস #{mess_id}\n"
+        f"🏷️ ধরন: {type_label}\n"
         f"📅 শুরু: {mess_info['start_date']}\n"
         f"📅 শেষ: {mess_info['end_date']}\n"
         f"📌 মাস: {mess_info['month_name']}\n"
@@ -816,6 +1068,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if data == 'new_mess':
         await new_mess(update, context)
+    
+    elif data.startswith('newmess_type_'):
+        mess_type = data.replace('newmess_type_', '')
+        context.user_data['new_mess_type'] = mess_type
+        await query.edit_message_text(
+            f"✅ ধরন: {MESS_TYPE_LABELS.get(mess_type, mess_type)}\n\n"
+            f"📅 **মেস শুরুর তারিখ লিখুন** (যেমন: 2026-01-01):",
+            parse_mode='Markdown'
+        )
+        context.user_data['action'] = 'new_mess_date'
     
     elif data == 'old_messes':
         messes = get_user_messes(user_id)
@@ -856,6 +1118,112 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
         await query.edit_message_text("📂 **মেস পরিবর্তন করুন:**", reply_markup=InlineKeyboardMarkup(keyboard))
     
+    elif data.startswith('mill_date_today|'):
+        mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিন মিল এন্ট্রি দিতে পারবেন!", show_alert=True)
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        await start_mill_exception_flow(query, context, mess_id, today, via_edit=True)
+    
+    elif data.startswith('mill_date_custom|'):
+        mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিন মিল এন্ট্রি দিতে পারবেন!", show_alert=True)
+            return
+        context.user_data['action'] = f'mill_custom_date|{mess_id}'
+        await query.edit_message_text("🗓️ **তারিখ লিখুন** (যেমন: 2026-01-15):")
+    
+    elif data.startswith('mill_exc_no|'):
+        mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        mill_date = context.user_data.get('mill_date')
+        usernames = [u for u, _ in get_users(mess_id)]
+        presets = get_daily_default_mills(mess_id, usernames)
+        bulk_set_mills_for_date(mess_id, mill_date, usernames, presets, {})
+        context.user_data['mill_exceptions'] = {}
+        lines = "\n".join(f"@{u}: {presets[u]:g}" for u in usernames)
+        await query.edit_message_text(
+            f"✅ **{mill_date}** তারিখের জন্য যার যার প্রিসেট অনুযায়ী মিল সেভ হয়েছে!\n\n{lines}",
+            parse_mode='Markdown'
+        )
+    
+    elif data.startswith('mill_exc_yes|'):
+        mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        await show_mill_exception_menu(query, context, mess_id, edit=True)
+    
+    elif data.startswith('mill_user|'):
+        _, mess_id_s, username = data.split('|')
+        mess_id = int(mess_id_s)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        keyboard = [[InlineKeyboardButton(label, callback_data=f'mill_set|{mess_id}|{username}|{val}') for label, val in MILL_QUICK_VALUES[:3]],
+                    [InlineKeyboardButton(label, callback_data=f'mill_set|{mess_id}|{username}|{val}') for label, val in MILL_QUICK_VALUES[3:]],
+                    [InlineKeyboardButton("✍️ অন্য সংখ্যা লিখবো", callback_data=f'mill_custom_val|{mess_id}|{username}')],
+                    [InlineKeyboardButton("🔙 ব্যাক", callback_data=f'mill_exc_yes|{mess_id}')]]
+        await query.edit_message_text(
+            f"@{username} — কয়টা মিল খেয়েছে (তারিখ: {context.user_data.get('mill_date')})?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data.startswith('mill_set|'):
+        _, mess_id_s, username, value = data.split('|')
+        mess_id = int(mess_id_s)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        context.user_data.setdefault('mill_exceptions', {})[username] = _mill_val_to_float(value)
+        await show_mill_exception_menu(query, context, mess_id, edit=True)
+    
+    elif data.startswith('mill_custom_val|'):
+        _, mess_id_s, username = data.split('|')
+        mess_id = int(mess_id_s)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        context.user_data['action'] = f'mill_custom_value|{mess_id}|{username}'
+        await query.edit_message_text(f"✍️ @{username} এর মিল সংখ্যা লিখুন (যেমন: 1.5):")
+    
+    elif data.startswith('mill_confirm|'):
+        mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        mill_date = context.user_data.get('mill_date')
+        exceptions = context.user_data.get('mill_exceptions', {})
+        usernames = [u for u, _ in get_users(mess_id)]
+        presets = get_daily_default_mills(mess_id, usernames)
+        bulk_set_mills_for_date(mess_id, mill_date, usernames, presets, exceptions)
+        lines = "\n".join(
+            f"@{u}: {exceptions.get(u, presets[u]):g}" + ("" if u in exceptions else " (প্রিসেট)")
+            for u in usernames
+        )
+        context.user_data['mill_exceptions'] = {}
+        await query.edit_message_text(f"✅ **{mill_date}** তারিখের মিল সেভ হয়েছে!\n\n{lines}", parse_mode='Markdown')
+    
+    elif data.startswith('meal_step|'):
+        _, mess_id_s, meal, value = data.split('|')
+        mess_id = int(mess_id_s)
+        context.user_data.setdefault('meal_values', {})[meal] = _mill_val_to_float(value)
+        idx = MEAL_ORDER.index(meal)
+        if idx + 1 < len(MEAL_ORDER):
+            await ask_meal_step(query, context, mess_id, MEAL_ORDER[idx + 1], edit=True)
+        else:
+            username = context.user_data.get('meal_username') or (update.effective_user.username or update.effective_user.first_name)
+            await _finish_meal_preset(query, context, mess_id, username)
+    
+    elif data.startswith('meal_custom|'):
+        _, mess_id_s, meal = data.split('|')
+        mess_id = int(mess_id_s)
+        context.user_data['action'] = f'meal_custom_text|{mess_id}|{meal}'
+        await query.edit_message_text(f"✍️ {MEAL_LABELS[meal]} এ কয়টা মিল খাও, লিখো (যেমন: 0.5):")
+    
     elif data.startswith('add_user_'):
         mess_id = int(data.replace('add_user_', ''))
         if not is_admin(user_id, mess_id):
@@ -890,6 +1258,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users = get_users(mess_id)
         if not users:
             await query.edit_message_text("❌ কোনো ইউজার নেই! আগে ইউজার যোগ করুন।")
+            return
+        if len(users) == 1:
+            # ব্যক্তিগত/একক-ইউজার মেসে সরাসরি amount জিজ্ঞেস করি, বাছাইয়ের ধাপ বাদ দিয়ে
+            username = users[0][0]
+            context.user_data['deposit_user'] = username
+            context.user_data['deposit_mess_id'] = mess_id
+            context.user_data['action'] = f'deposit_amount_{mess_id}'
+            await query.edit_message_text(f"💵 জমার পরিমাণ লিখুন (শুধু সংখ্যা):")
             return
         keyboard = []
         for username, full_name in users:
@@ -1078,8 +1454,32 @@ def build_summary_text(mess_id):
     if balance < 0:
         text += "\n\n⚠️ *সতর্কতা: খরচ ডিপোজিটের চেয়ে বেশি!*"
     
-    # মাথাপিছু হিসাব — শুধু খরচ ৫০০০ টাকা বা তার বেশি হলে দেখাবে
-    if users and total_exp >= 5000:
+    mess_type = mess_info.get('mess_type', 'simple')
+    
+    if mess_type == 'student' and users:
+        s_date = mess_info['start_date']
+        e_date = mess_info['end_date'] if mess_info['end_date'] != 'চলমান' else datetime.now().strftime("%Y-%m-%d")
+        daily_totals = get_daily_mill_totals(mess_id, s_date, e_date)
+        if daily_totals:
+            text += "\n\n🍽️ **সাম্প্রতিক দিনের মোট মিল:**\n"
+            for d in sorted(daily_totals.keys())[-7:]:
+                text += f"  {d}: {daily_totals[d]:g} মিল\n"
+        total_mills = get_total_mills(mess_id, s_date, e_date)
+        if total_mills > 0:
+            per_mill = total_exp / total_mills
+            text += f"\n🧮 **মিল হিসাব**\n"
+            text += f"মোট খরচ {total_exp:.2f} ÷ মোট {total_mills:g} মিল = প্রতি মিল {per_mill:.2f} টাকা\n"
+            for username, full_name in users:
+                dep = get_user_deposits(username, mess_id)
+                user_mills = get_user_mill_total(mess_id, username, s_date, e_date)
+                diff = dep - (user_mills * per_mill)
+                if diff >= 0:
+                    text += f"  @{username}: {user_mills:g} মিল, +{diff:.2f} টাকা (ফেরত পাবে)\n"
+                else:
+                    text += f"  @{username}: {user_mills:g} মিল, {diff:.2f} টাকা (দিতে হবে)\n"
+    
+    # মাথাপিছু হিসাব — শুধু খরচ ৫০০০ টাকা বা তার বেশি হলে দেখাবে (simple/personal মেসের জন্য)
+    if mess_type != 'student' and users and total_exp >= 5000:
         per_head = total_exp / len(users)
         text += f"\n\n🧮 **মাথাপিছু হিসাব**\n"
         text += f"মোট খরচ {total_exp:.2f} ÷ {len(users)} জন = মাথাপিছু {per_head:.2f} টাকা\n"
@@ -1149,22 +1549,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == 'new_mess_month':
         month_name = text
         start_date = context.user_data['new_mess_date']
+        mess_type = context.user_data.get('new_mess_type', 'simple')
         mess_id = get_next_mess_id()
-        save_mess_info(mess_id, start_date, 'চলমান', month_name)
+        save_mess_info(mess_id, start_date, 'চলমান', month_name, mess_type=mess_type)
         user_id = update.effective_user.id
         tg_username = update.effective_user.username or update.effective_user.first_name
         add_admin(user_id, mess_id, tg_username)
         add_user(tg_username, mess_id, user_id=user_id)
         set_current_mess_id(user_id, mess_id)
         context.user_data['action'] = None
+        context.user_data['new_mess_type'] = None
+        extra_hint = ""
+        if mess_type == 'student':
+            extra_hint = "\n\n📌 প্রতিদিন মিল এন্ট্রি দিতে /mill_entry কমান্ড ব্যবহার করুন।"
+        elif mess_type == 'personal':
+            extra_hint = "\n\n📌 এটি আপনার ব্যক্তিগত হিসাব — শুধু আপনার ডিপোজিট/খরচ যোগ করুন।"
         await update.message.reply_text(
             f"✅ **নতুন মেস শুরু হয়েছে!**\n\n"
             f"🆔 মেস নম্বর: #{mess_id}\n"
             f"📅 শুরুর তারিখ: {start_date}\n"
             f"📌 মাস: {month_name}\n"
+            f"🏷️ ধরন: {MESS_TYPE_LABELS.get(mess_type, mess_type)}\n"
             f"👑 আপনি এই মেসের এডমিন\n"
             f"💰 বর্তমান ব্যালেন্স: 0.00 টাকা\n\n"
-            f"এখন ইউজার যোগ করুন এবং ডিপোজিট শুরু করুন!"
+            f"এখন ইউজার যোগ করুন এবং ডিপোজিট শুরু করুন!{extra_hint}"
         )
         await show_main_menu(update.message, mess_id, user_id)
     
@@ -1182,6 +1590,50 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_main_menu(update.message, mess_id, update.effective_user.id)
         except ValueError:
             await update.message.reply_text("❌ ভুল ফরম্যাট! তারিখটি YYYY-MM-DD ফরম্যাটে দিন।")
+    
+    elif action.startswith('meal_custom_text|'):
+        _, mess_id_s, meal = action.split('|')
+        mess_id = int(mess_id_s)
+        try:
+            value = float(text.strip())
+            if value < 0:
+                raise ValueError
+            context.user_data.setdefault('meal_values', {})[meal] = value
+            context.user_data['action'] = None
+            idx = MEAL_ORDER.index(meal)
+            if idx + 1 < len(MEAL_ORDER):
+                await ask_meal_step(update.message, context, mess_id, MEAL_ORDER[idx + 1], edit=False)
+            else:
+                username = context.user_data.get('meal_username') or (update.effective_user.username or update.effective_user.first_name)
+                await _finish_meal_preset(update.message, context, mess_id, username)
+        except ValueError:
+            await update.message.reply_text("❌ দয়া করে ০ বা তার বেশি একটি সংখ্যা দিন (যেমন: 0, 0.5, 1):")
+    
+    elif action.startswith('mill_custom_date|'):
+        mess_id = int(action.split('|')[1])
+        if not is_admin(update.effective_user.id, mess_id):
+            context.user_data['action'] = None
+            return
+        try:
+            mill_date = text.strip()
+            datetime.strptime(mill_date, "%Y-%m-%d")
+            context.user_data['action'] = None
+            await start_mill_exception_flow(update.message, context, mess_id, mill_date)
+        except ValueError:
+            await update.message.reply_text("❌ ভুল ফরম্যাট! তারিখটি YYYY-MM-DD ফরম্যাটে দিন (যেমন: 2026-01-15)।")
+    
+    elif action.startswith('mill_custom_value|'):
+        _, mess_id_s, username = action.split('|')
+        mess_id = int(mess_id_s)
+        try:
+            value = float(text.strip())
+            if value < 0:
+                raise ValueError
+            context.user_data.setdefault('mill_exceptions', {})[username] = value
+            context.user_data['action'] = None
+            await show_mill_exception_menu(update.message, context, mess_id, edit=False)
+        except ValueError:
+            await update.message.reply_text("❌ দয়া করে ০ বা তার বেশি একটি সংখ্যা দিন (যেমন: 0, 0.5, 1, 2):")
     
     elif action.startswith('add_user_'):
         mess_id = int(action.replace('add_user_', ''))
@@ -1337,6 +1789,130 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ PDF তৈরি করতে সমস্যা হয়েছে: {str(e)}")
 
+MILL_QUICK_VALUES = [("নাই", "0"), ("হাফ", "0_5"), ("১", "1"), ("দেড়", "1_5"), ("২", "2")]
+
+def _mill_val_to_float(v):
+    return float(v.replace('_', '.'))
+
+async def mill_entry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mess_id = await _active_mess_or_prompt(update)
+    if not mess_id:
+        return
+    user_id = update.effective_user.id
+    if not is_admin(user_id, mess_id):
+        await update.message.reply_text("❌ শুধুমাত্র এডমিন মিল এন্ট্রি দিতে পারবেন!")
+        return
+    mess_info = get_mess_info(mess_id)
+    if mess_info.get('mess_type') != 'student':
+        await update.message.reply_text("❌ এই মেসটি স্টুডেন্ট (মিল হিসাব) ধরনের নয়।")
+        return
+    if is_mess_completed(mess_id):
+        await update.message.reply_text("❌ এই মেস সম্পন্ন হয়েছে! মিল এন্ট্রি দেওয়া যাবে না।")
+        return
+    if not get_users(mess_id):
+        await update.message.reply_text("❌ কোনো ইউজার নেই! আগে /adduser দিয়ে ইউজার যোগ করুন।")
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    keyboard = [
+        [InlineKeyboardButton(f"📅 আজকে ({today})", callback_data=f'mill_date_today|{mess_id}')],
+        [InlineKeyboardButton("🗓️ অন্য তারিখ লিখবো", callback_data=f'mill_date_custom|{mess_id}')]
+    ]
+    await update.message.reply_text(
+        "🍽️ **মিল এন্ট্রি**\n\nকোন তারিখের জন্য মিল এন্ট্রি দিতে চান?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+async def start_mill_exception_flow(update_or_query, context, mess_id, mill_date, via_edit=False):
+    context.user_data['mill_mess_id'] = mess_id
+    context.user_data['mill_date'] = mill_date
+    context.user_data['mill_exceptions'] = {}
+    keyboard = [
+        [InlineKeyboardButton("✅ হ্যাঁ, ব্যতিক্রম আছে", callback_data=f'mill_exc_yes|{mess_id}')],
+        [InlineKeyboardButton("🚀 না, সবাই নিজের প্রিসেট অনুযায়ী খেয়েছে", callback_data=f'mill_exc_no|{mess_id}')]
+    ]
+    text = f"📅 তারিখ: **{mill_date}**\n\nকারো মিল সংখ্যায় ব্যতিক্রম (কম/বেশি/অনুপস্থিত) আছে কি?"
+    if via_edit:
+        await update_or_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await update_or_query.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def show_mill_exception_menu(message_or_query, context, mess_id, edit=True):
+    users = get_users(mess_id)
+    exceptions = context.user_data.get('mill_exceptions', {})
+    mill_date = context.user_data.get('mill_date')
+    keyboard = []
+    for username, full_name in users:
+        preset_total = get_preset_total(mess_id, username)
+        if username in exceptions:
+            mark = f" ✏️ {exceptions[username]:g}"
+        else:
+            mark = f" (প্রিসেট: {preset_total:g})"
+        keyboard.append([InlineKeyboardButton(f"@{username}{mark}", callback_data=f'mill_user|{mess_id}|{username}')])
+    keyboard.append([InlineKeyboardButton("✅ সম্পন্ন — বাকিরা নিজের প্রিসেট", callback_data=f'mill_confirm|{mess_id}')])
+    text = f"📅 তারিখ: **{mill_date}**\n\nযাদের আজ ব্যতিক্রম আছে তাদের নামে ট্যাপ করুন (নাহলে যার যার সকাল+দুপুর+রাত প্রিসেট অনুযায়ী মিল বসবে)।\nবাছাই শেষে ✅ চাপুন।"
+    if edit and hasattr(message_or_query, 'edit_message_text'):
+        await message_or_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await message_or_query.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+MEAL_LABELS = {'breakfast': '🌅 সকাল', 'lunch': '☀️ দুপুর', 'dinner': '🌙 রাত'}
+MEAL_ORDER = ['breakfast', 'lunch', 'dinner']
+
+async def ask_meal_step(message_or_query, context, mess_id, meal, edit=False):
+    label = MEAL_LABELS[meal]
+    keyboard = [
+        [InlineKeyboardButton(l, callback_data=f'meal_step|{mess_id}|{meal}|{v}') for l, v in MILL_QUICK_VALUES[:3]],
+        [InlineKeyboardButton(l, callback_data=f'meal_step|{mess_id}|{meal}|{v}') for l, v in MILL_QUICK_VALUES[3:]],
+        [InlineKeyboardButton("✍️ অন্য সংখ্যা", callback_data=f'meal_custom|{mess_id}|{meal}')]
+    ]
+    text = f"{label} এ সাধারণত কয়টা মিল খাও?"
+    if edit:
+        await message_or_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await message_or_query.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def _finish_meal_preset(reply_target, context, mess_id, username):
+    vals = context.user_data.get('meal_values', {})
+    b, l, d = vals.get('breakfast', 1.0), vals.get('lunch', 1.0), vals.get('dinner', 1.0)
+    set_meal_preset(mess_id, username, b, l, d)
+    total = b + l + d
+    context.user_data['meal_values'] = {}
+    text = (
+        f"✅ **প্রিসেট সেভ হয়েছে!**\n\n"
+        f"🌅 সকাল {b:g} + ☀️ দুপুর {l:g} + 🌙 রাত {d:g} = **দৈনিক {total:g} মিল**\n\n"
+        f"এখন থেকে admin bulk এন্ট্রি করলে এটাই তোমার ডিফল্ট মিল হিসেবে বসবে। বদলাতে চাইলে আবার /meal_setting করো।"
+    )
+    if hasattr(reply_target, 'edit_message_text'):
+        await reply_target.edit_message_text(text, parse_mode='Markdown')
+    else:
+        await reply_target.reply_text(text, parse_mode='Markdown')
+
+async def meal_setting_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mess_id = await _active_mess_or_prompt(update)
+    if not mess_id:
+        return
+    mess_info = get_mess_info(mess_id)
+    if mess_info.get('mess_type') != 'student':
+        await update.message.reply_text("❌ এই মেসটি স্টুডেন্ট (মিল হিসাব) ধরনের নয়, প্রিসেট প্রযোজ্য নয়।")
+        return
+    user_id = update.effective_user.id
+    if not is_member_or_admin(user_id, mess_id):
+        await update.message.reply_text("❌ আপনি এই মেসের সদস্য নন!")
+        return
+    tg_username = update.effective_user.username or update.effective_user.first_name
+    context.user_data['meal_mess_id'] = mess_id
+    context.user_data['meal_username'] = tg_username
+    context.user_data['meal_values'] = {}
+    current = get_meal_preset(mess_id, tg_username)
+    await update.message.reply_text(
+        f"🍽️ **তোমার দৈনিক মিল প্রিসেট সেট করো**\n\n"
+        f"বর্তমান: সকাল {current['breakfast']:g}, দুপুর {current['lunch']:g}, রাত {current['dinner']:g}\n\n"
+        f"একে একে সকাল/দুপুর/রাতের মিল সংখ্যা বেছে নাও:",
+        parse_mode='Markdown'
+    )
+    await ask_meal_step(update.message, context, mess_id, 'breakfast')
+
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mess_id = await _active_mess_or_prompt(update)
     if not mess_id:
@@ -1375,6 +1951,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 /summary — সারাংশ দেখুন\n"
         "📋 /history — লেনদেনের ইতিহাস\n"
         "📄 /report — ফাইনাল রিপোর্ট (PDF)\n"
+        "🍽️ /mill_entry — দিনের মিল এন্ট্রি (স্টুডেন্ট মেস, এডমিন)\n"
+        "🌅 /meal_setting — নিজের সকাল/দুপুর/রাতের মিল প্রিসেট সেট করুন (স্টুডেন্ট মেস)\n"
         "⚙️ /admin — এডমিন ম্যানেজমেন্ট (এডমিন)\n"
         "🔚 /endmess — মেস শেষ করুন (এডমিন)\n"
         "❓ /help — এই সাহায্য বার্তা\n\n"
@@ -1392,6 +1970,8 @@ async def post_init(application: Application):
         BotCommand("addexpense", "💸 খরচ যোগ করুন"),
         BotCommand("history", "📋 লেনদেনের ইতিহাস"),
         BotCommand("report", "📄 ফাইনাল রিপোর্ট (PDF)"),
+        BotCommand("mill_entry", "🍽️ দিনের মিল এন্ট্রি"),
+        BotCommand("meal_setting", "🌅 আমার মিল প্রিসেট সেট করো"),
         BotCommand("adduser", "👥 ইউজার যোগ করুন"),
         BotCommand("admin", "⚙️ এডমিন ম্যানেজমেন্ট"),
         BotCommand("endmess", "🔚 মেস শেষ করুন"),
@@ -1412,6 +1992,8 @@ def main():
     app.add_handler(CommandHandler("summary", summary_command))
     app.add_handler(CommandHandler("addexpense", addexpense_command))
     app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("mill_entry", mill_entry_command))
+    app.add_handler(CommandHandler("meal_setting", meal_setting_command))
     app.add_handler(CommandHandler("report", report_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("endmess", endmess_command))
