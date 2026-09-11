@@ -1,6 +1,7 @@
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from reportlab.lib.pagesizes import A4
@@ -93,6 +94,13 @@ def init_db():
         c.execute("ALTER TABLE mess_settings ADD COLUMN mess_type TEXT")
     if 'default_mill_count' not in columns:
         c.execute("ALTER TABLE mess_settings ADD COLUMN default_mill_count REAL")
+    if 'creator_user_id' not in columns:
+        c.execute("ALTER TABLE mess_settings ADD COLUMN creator_user_id INTEGER")
+    if 'type_ordinal' not in columns:
+        c.execute("ALTER TABLE mess_settings ADD COLUMN type_ordinal INTEGER")
+    if 'default_breakfast' not in columns:
+        c.execute("ALTER TABLE mess_settings ADD COLUMN default_breakfast REAL")
+    conn.commit()
     
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,8 +177,31 @@ def init_db():
         dinner REAL NOT NULL DEFAULT 1,
         PRIMARY KEY (mess_id, username)
     )''')
-    
     conn.commit()
+    
+    # পুরনো মেস (creator_user_id/type_ordinal ছাড়া) একবারই ব্যাকফিল করা হয়
+    c.execute("SELECT key FROM mess_settings WHERE key LIKE 'mess_%_info' AND (creator_user_id IS NULL OR type_ordinal IS NULL)")
+    legacy_keys = [r[0] for r in c.fetchall()]
+    if legacy_keys:
+        for key in legacy_keys:
+            mess_id_legacy = int(key.split('_')[1])
+            c.execute("SELECT user_id FROM admins WHERE mess_id = ? ORDER BY user_id LIMIT 1", (mess_id_legacy,))
+            admin_row = c.fetchone()
+            creator = admin_row[0] if admin_row else 0
+            c.execute("UPDATE mess_settings SET creator_user_id = COALESCE(creator_user_id, ?) WHERE key = ?", (creator, key))
+        conn.commit()
+        
+        c.execute("""SELECT key, creator_user_id, mess_type FROM mess_settings
+                     WHERE key LIKE 'mess_%_info'
+                     ORDER BY CAST(SUBSTR(key, 6, LENGTH(key)-10) AS INTEGER)""")
+        all_rows = c.fetchall()
+        counters = {}
+        for key, creator, mtype in all_rows:
+            mtype = mtype or 'simple'
+            counters[(creator, mtype)] = counters.get((creator, mtype), 0) + 1
+            c.execute("UPDATE mess_settings SET type_ordinal = COALESCE(type_ordinal, ?) WHERE key = ?", (counters[(creator, mtype)], key))
+        conn.commit()
+    
     conn.close()
 
 def get_setting(key):
@@ -207,7 +238,7 @@ def get_mess_info(mess_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute("SELECT start_date, end_date, month_name, mess_type, default_mill_count FROM mess_settings WHERE key = ?", (f'mess_{mess_id}_info',))
+        c.execute("SELECT start_date, end_date, month_name, mess_type, default_mill_count, creator_user_id, type_ordinal, default_breakfast FROM mess_settings WHERE key = ?", (f'mess_{mess_id}_info',))
         result = c.fetchone()
         conn.close()
         if result:
@@ -216,37 +247,65 @@ def get_mess_info(mess_id):
                 'end_date': result[1] or 'চলমান',
                 'month_name': result[2] or 'অজানা',
                 'mess_type': result[3] or 'simple',
-                'default_mill_count': result[4] if result[4] is not None else 1.0
+                'default_mill_count': result[4] if result[4] is not None else 1.0,
+                'creator_user_id': result[5],
+                'type_ordinal': result[6],
+                'default_breakfast': result[7] if result[7] is not None else 1.0
             }
         return None
     except:
         conn.close()
         return None
 
-def save_mess_info(mess_id, start_date, end_date, month_name, mess_type='simple', default_mill_count=1.0):
+def save_mess_info(mess_id, start_date, end_date, month_name, mess_type='simple', default_mill_count=1.0, creator_user_id=None, type_ordinal=None, default_breakfast=1.0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO mess_settings (key, value, start_date, end_date, month_name, mess_type, default_mill_count) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-              (f'mess_{mess_id}_info', f'{start_date}|{end_date}|{month_name}', start_date, end_date, month_name, mess_type, default_mill_count))
+    c.execute("""INSERT OR REPLACE INTO mess_settings
+                 (key, value, start_date, end_date, month_name, mess_type, default_mill_count, creator_user_id, type_ordinal, default_breakfast)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+              (f'mess_{mess_id}_info', f'{start_date}|{end_date}|{month_name}', start_date, end_date, month_name,
+               mess_type, default_mill_count, creator_user_id, type_ordinal, default_breakfast))
     conn.commit()
     conn.close()
+
+def get_next_type_ordinal(creator_user_id, mess_type):
+    """এই ইউজার এর আগে যে কয়টা এই ধরনের (type) মেস শুরু করেছে, তার পরের নম্বর"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM mess_settings WHERE key LIKE 'mess_%_info' AND creator_user_id = ? AND mess_type = ?",
+              (creator_user_id, mess_type))
+    count = c.fetchone()[0]
+    conn.close()
+    return count + 1
+
+MESS_TYPE_SHORT = {'simple': 'Normal', 'student': 'Student', 'personal': 'Personal'}
+
+def mess_display_label(mess_info):
+    """ইউজারকে দেখানোর জন্য - যেমন 'Student মেস #1' - যাতে প্রতিটা ইউজার নিজের মতো ১ থেকে শুরু করা মেস নম্বর দেখে"""
+    mess_type = mess_info.get('mess_type', 'simple') if mess_info else 'simple'
+    ordinal = mess_info.get('type_ordinal') if mess_info else None
+    short = MESS_TYPE_SHORT.get(mess_type, mess_type)
+    if ordinal:
+        return f"{short} মেস #{ordinal}"
+    return f"{short} মেস"
 
 def get_all_messes():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT key, start_date, end_date, month_name, mess_type FROM mess_settings WHERE key LIKE 'mess_%_info'")
+    c.execute("SELECT key, start_date, end_date, month_name, mess_type, type_ordinal FROM mess_settings WHERE key LIKE 'mess_%_info'")
     results = c.fetchall()
     conn.close()
     
     messes = []
-    for key, start_date, end_date, month_name, mess_type in results:
+    for key, start_date, end_date, month_name, mess_type, type_ordinal in results:
         mess_id = key.split('_')[1]
         messes.append({
             'id': int(mess_id),
             'start_date': start_date or 'অজানা',
             'end_date': end_date or 'চলমান',
             'month_name': month_name or 'অজানা',
-            'mess_type': mess_type or 'simple'
+            'mess_type': mess_type or 'simple',
+            'type_ordinal': type_ordinal
         })
     return sorted(messes, key=lambda x: x['id'], reverse=True)
 
@@ -277,6 +336,15 @@ def get_users(mess_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT username, full_name FROM users WHERE mess_id = ?", (mess_id,))
+    users = c.fetchall()
+    conn.close()
+    return users
+
+def get_users_with_ids(mess_id):
+    """(username, user_id) - শুধু যাদের telegram user_id লিংক করা আছে (তাদেরই DM পাঠানো সম্ভব)"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username, user_id FROM users WHERE mess_id = ? AND user_id IS NOT NULL", (mess_id,))
     users = c.fetchall()
     conn.close()
     return users
@@ -552,7 +620,10 @@ def get_meal_preset(mess_id, username):
     conn.close()
     if result:
         return {'breakfast': result[0], 'lunch': result[1], 'dinner': result[2]}
-    return {'breakfast': 1.0, 'lunch': 1.0, 'dinner': 1.0}  # প্রিসেট সেট না করলে ডিফল্ট ১+১+১
+    # কেউ নিজে প্রিসেট সেট না করলে, মেস তৈরির সময় বেছে নেওয়া সকালের কনভেনশন (১/২ বা ১) ডিফল্ট হিসেবে ধরা হয়
+    mess_info = get_mess_info(mess_id)
+    default_bf = mess_info.get('default_breakfast', 1.0) if mess_info else 1.0
+    return {'breakfast': default_bf, 'lunch': 1.0, 'dinner': 1.0}
 
 def set_meal_preset(mess_id, username, breakfast, lunch, dinner):
     conn = sqlite3.connect(DB_PATH)
@@ -572,6 +643,23 @@ def get_preset_total(mess_id, username):
 def get_daily_default_mills(mess_id, usernames):
     """প্রতিটা ইউজারের নিজস্ব সকাল+দুপুর+রাত প্রিসেট অনুযায়ী দৈনিক ডিফল্ট মিল সংখ্যা"""
     return {u: get_preset_total(mess_id, u) for u in usernames}
+
+def auto_fill_missing_mills_for_date(mess_id, mill_date):
+    """যাদের জন্য এখনো এই তারিখে কোনো মিল এন্ট্রি হয়নি (admin ম্যানুয়াল দেয়নি), তাদের জন্য
+    প্রিসেট অনুযায়ী অটো-ফিল করে। যাদের ইতিমধ্যে এন্ট্রি আছে (admin এর ব্যতিক্রম সহ) তা বদলায় না।"""
+    usernames = [u for u, _ in get_users(mess_id)]
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    filled = []
+    for username in usernames:
+        preset_total = get_preset_total(mess_id, username)
+        c.execute("""INSERT OR IGNORE INTO mills (mess_id, username, mill_date, mill_count) VALUES (?, ?, ?, ?)""",
+                  (mess_id, username, mill_date, preset_total))
+        if c.rowcount > 0:
+            filled.append((username, preset_total))
+    conn.commit()
+    conn.close()
+    return filled
 
 def get_next_mess_id():
     conn = sqlite3.connect(DB_PATH)
@@ -631,7 +719,7 @@ def generate_pdf_report(mess_id):
     story.append(Spacer(1, 14))
     
     # মেস ইনফো
-    story.append(bn_text(f"মেস নম্বর: #{mess_id}", size=12))
+    story.append(bn_text(f"মেস নম্বর: {mess_display_label(mess_info)}", size=12))
     story.append(Spacer(1, 4))
     story.append(bn_text(f"মাস: {mess_info['month_name']}", size=12))
     story.append(Spacer(1, 4))
@@ -985,7 +1073,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for mess in my_messes:
             status = "✅" if mess['end_date'] != 'চলমান' else "🟢"
             keyboard.append([InlineKeyboardButton(
-                f"{status} #{mess['id']} - {mess['month_name']}",
+                f"{status} {mess_display_label(mess)} - {mess['month_name']}",
                 callback_data=f'switch_mess_{mess["id"]}'
             )])
         keyboard.append([InlineKeyboardButton("🆕 নতুন মেস শুরু করুন", callback_data='new_mess')])
@@ -1049,7 +1137,7 @@ async def show_main_menu(message, mess_id, user_id=None):
     
     await message.reply_text(
         f"📆 **মেস ইনফো**\n"
-        f"🆔 মেস #{mess_id}\n"
+        f"🆔 {mess_display_label(mess_info)}\n"
         f"🏷️ ধরন: {type_label}\n"
         f"📅 শুরু: {mess_info['start_date']}\n"
         f"📅 শেষ: {mess_info['end_date']}\n"
@@ -1069,11 +1157,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == 'new_mess':
         await new_mess(update, context)
     
+    elif data == 'show_guide':
+        await query.message.reply_text(build_guide_text(), parse_mode='HTML')
+    
     elif data.startswith('newmess_type_'):
         mess_type = data.replace('newmess_type_', '')
         context.user_data['new_mess_type'] = mess_type
+        if mess_type == 'student':
+            keyboard = [
+                [InlineKeyboardButton("১/২ (হাফ)", callback_data='newmess_bf|0.5')],
+                [InlineKeyboardButton("১ (পূর্ণ)", callback_data='newmess_bf|1')]
+            ]
+            await query.edit_message_text(
+                f"✅ ধরন: {MESS_TYPE_LABELS.get(mess_type, mess_type)}\n\n"
+                f"🌅 তোমাদের মেসে সাধারণত সকালের মিল কত ধরে হিসাব হয়?\n"
+                f"(এটাই সবার ডিফল্ট হবে, যে কেউ চাইলে /meal_setting দিয়ে নিজেরটা বদলাতে পারবে)",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.edit_message_text(
+                f"✅ ধরন: {MESS_TYPE_LABELS.get(mess_type, mess_type)}\n\n"
+                f"📅 **মেস শুরুর তারিখ লিখুন** (যেমন: 2026-01-01):",
+                parse_mode='Markdown'
+            )
+            context.user_data['action'] = 'new_mess_date'
+    
+    elif data.startswith('newmess_bf|'):
+        value = float(data.split('|')[1])
+        context.user_data['new_mess_breakfast'] = value
         await query.edit_message_text(
-            f"✅ ধরন: {MESS_TYPE_LABELS.get(mess_type, mess_type)}\n\n"
+            f"✅ সকালের ডিফল্ট মিল: {value:g}\n\n"
             f"📅 **মেস শুরুর তারিখ লিখুন** (যেমন: 2026-01-01):",
             parse_mode='Markdown'
         )
@@ -1088,7 +1201,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for mess in messes:
             status = "✅" if mess['end_date'] != 'চলমান' else "🟢"
             keyboard.append([InlineKeyboardButton(
-                f"{status} #{mess['id']} - {mess['month_name']} ({mess['start_date']} - {mess['end_date']})", 
+                f"{status} {mess_display_label(mess)} - {mess['month_name']} ({mess['start_date']} - {mess['end_date']})", 
                 callback_data=f'switch_mess_{mess["id"]}'
             )])
         keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data='back_start')])
@@ -1100,7 +1213,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ আপনি এই মেসের সদস্য নন!", show_alert=True)
             return
         set_current_mess_id(user_id, mess_id)
-        await query.edit_message_text(f"✅ মেস #{mess_id} এ স্যুইচ করা হয়েছে!")
+        await query.edit_message_text(f"✅ {mess_display_label(get_mess_info(mess_id))} এ স্যুইচ করা হয়েছে!")
         await show_main_menu(query.message, mess_id, user_id)
     
     elif data == 'back_start':
@@ -1405,7 +1518,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_document(
                 document=pdf_buffer,
                 filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
-                caption=f"📄 মেস #{mess_id} এর ফাইনাল রিপোর্ট"
+                caption=f"📄 {mess_display_label(get_mess_info(mess_id))} এর ফাইনাল রিপোর্ট"
             )
             await query.delete_message()
         except Exception as e:
@@ -1434,7 +1547,7 @@ def build_summary_text(mess_id):
         return None
     
     text = f"📊 **মেসের সারাংশ**\n"
-    text += f"🆔 মেস #{mess_id}\n"
+    text += f"🆔 {mess_display_label(mess_info)}\n"
     text += f"📅 মাস: {mess_info['month_name']}\n"
     text += f"📅 সময়কাল: {mess_info['start_date']} - {mess_info['end_date']}\n"
     text += "="*30 + "\n\n"
@@ -1504,7 +1617,7 @@ def build_history_text(mess_id):
     deposits = get_recent_deposits(mess_id, 10)
     expenses = get_recent_expenses(mess_id, 10)
     
-    text = f"📋 **সর্বশেষ লেনদেন** (মেস #{mess_id})\n"
+    text = f"📋 **সর্বশেষ লেনদেন** ({mess_display_label(get_mess_info(mess_id))})\n"
     text += "="*30 + "\n\n"
     
     text += "💰 **ডিপোজিট:**\n"
@@ -1551,14 +1664,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start_date = context.user_data['new_mess_date']
         mess_type = context.user_data.get('new_mess_type', 'simple')
         mess_id = get_next_mess_id()
-        save_mess_info(mess_id, start_date, 'চলমান', month_name, mess_type=mess_type)
         user_id = update.effective_user.id
+        type_ordinal = get_next_type_ordinal(user_id, mess_type)
+        default_breakfast = context.user_data.get('new_mess_breakfast', 1.0)
+        save_mess_info(mess_id, start_date, 'চলমান', month_name, mess_type=mess_type,
+                        creator_user_id=user_id, type_ordinal=type_ordinal, default_breakfast=default_breakfast)
         tg_username = update.effective_user.username or update.effective_user.first_name
         add_admin(user_id, mess_id, tg_username)
         add_user(tg_username, mess_id, user_id=user_id)
         set_current_mess_id(user_id, mess_id)
         context.user_data['action'] = None
         context.user_data['new_mess_type'] = None
+        context.user_data['new_mess_breakfast'] = None
+        label = mess_display_label(get_mess_info(mess_id))
         extra_hint = ""
         if mess_type == 'student':
             extra_hint = "\n\n📌 প্রতিদিন মিল এন্ট্রি দিতে /mill_entry কমান্ড ব্যবহার করুন।"
@@ -1566,7 +1684,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extra_hint = "\n\n📌 এটি আপনার ব্যক্তিগত হিসাব — শুধু আপনার ডিপোজিট/খরচ যোগ করুন।"
         await update.message.reply_text(
             f"✅ **নতুন মেস শুরু হয়েছে!**\n\n"
-            f"🆔 মেস নম্বর: #{mess_id}\n"
+            f"🆔 {label}\n"
             f"📅 শুরুর তারিখ: {start_date}\n"
             f"📌 মাস: {month_name}\n"
             f"🏷️ ধরন: {MESS_TYPE_LABELS.get(mess_type, mess_type)}\n"
@@ -1586,7 +1704,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             datetime.strptime(end_date, "%Y-%m-%d")
             complete_mess(mess_id, end_date)
             context.user_data['action'] = None
-            await update.message.reply_text(f"✅ **মেস #{mess_id} সম্পন্ন হয়েছে!**\n📅 শেষ তারিখ: {end_date}\n\nফাইনাল রিপোর্ট দেখতে '📄 ফাইনাল রিপোর্ট (PDF)' বাটনে ক্লিক করুন।")
+            await update.message.reply_text(f"✅ **{mess_display_label(get_mess_info(mess_id))} সম্পন্ন হয়েছে!**\n📅 শেষ তারিখ: {end_date}\n\nফাইনাল রিপোর্ট দেখতে '📄 ফাইনাল রিপোর্ট (PDF)' বাটনে ক্লিক করুন।")
             await show_main_menu(update.message, mess_id, update.effective_user.id)
         except ValueError:
             await update.message.reply_text("❌ ভুল ফরম্যাট! তারিখটি YYYY-MM-DD ফরম্যাটে দিন।")
@@ -1784,7 +1902,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=pdf_buffer,
             filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
-            caption=f"📄 মেস #{mess_id} এর ফাইনাল রিপোর্ট"
+            caption=f"📄 {mess_display_label(get_mess_info(mess_id))} এর ফাইনাল রিপোর্ট"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ PDF তৈরি করতে সমস্যা হয়েছে: {str(e)}")
@@ -1793,6 +1911,88 @@ MILL_QUICK_VALUES = [("নাই", "0"), ("হাফ", "0_5"), ("১", "1"), ("�
 
 def _mill_val_to_float(v):
     return float(v.replace('_', '.'))
+
+BD_TZ = ZoneInfo("Asia/Dhaka")
+
+async def auto_nightly_digest_job(context: ContextTypes.DEFAULT_TYPE):
+    """প্রতিদিন রাত ১১টায় (বাংলাদেশ সময়) চলে - পার্সোনাল বাদে সব ধরনের মেসের প্রতিটা সদস্যকে
+    তাদের /summary ও /history অটোমেটিক পাঠিয়ে দেয়, যাতে সবাই দিন শেষে হিসাবটা দেখে নিতে পারে"""
+    for mess in get_all_messes():
+        if mess.get('mess_type') == 'personal':
+            continue
+        if is_mess_completed(mess['id']):
+            continue
+        members = get_users_with_ids(mess['id'])
+        if not members:
+            continue
+        summary_text = build_summary_text(mess['id'])
+        history_text = build_history_text(mess['id'])
+        if not summary_text:
+            continue
+        for username, member_user_id in members:
+            try:
+                await context.bot.send_message(chat_id=member_user_id, text=f"🌙 রাত ১১টার দৈনিক আপডেট\n\n{summary_text}", parse_mode='Markdown')
+                await context.bot.send_message(chat_id=member_user_id, text=history_text, parse_mode='Markdown')
+            except Exception:
+                pass
+
+async def auto_apply_daily_mills_job(context: ContextTypes.DEFAULT_TYPE):
+    """প্রতিদিন রাত ১০টায় (বাংলাদেশ সময়) চলে - যাদের সেদিনের মিল এখনো এন্ট্রি হয়নি
+    (admin ম্যানুয়ালি কিছু করে থাকলে সেটা বাদে) তাদের জন্য নিজ নিজ প্রিসেট অনুযায়ী অটো-ফিল করে"""
+    today = datetime.now(BD_TZ).strftime("%Y-%m-%d")
+    for mess in get_all_messes():
+        if mess.get('mess_type') != 'student':
+            continue
+        if is_mess_completed(mess['id']):
+            continue
+        if not get_users(mess['id']):
+            continue
+        filled = auto_fill_missing_mills_for_date(mess['id'], today)
+        if not filled:
+            continue
+        lines = "\n".join(f"@{u}: {c:g} (প্রিসেট)" for u, c in filled)
+        text = (
+            f"🌙 <b>{mess_display_label(get_mess_info(mess['id']))} — {today}</b>\n\n"
+            f"রাত ১০টায় অটো মিল এন্ট্রি হয়েছে (যাদের আজ ম্যানুয়াল এন্ট্রি হয়নি):\n{lines}\n\n"
+            f"কারো ভুল হলে /mill_entry দিয়ে ঠিক করে নিতে পারবেন।"
+        )
+        for admin_user_id, _ in get_admins(mess['id']):
+            try:
+                await context.bot.send_message(chat_id=admin_user_id, text=text, parse_mode='HTML')
+            except Exception:
+                pass
+
+def build_guide_text():
+    return (
+        "📖 <b>ব্যবহারবিধি — মেস ম্যানেজমেন্ট বট</b>\n\n"
+        "🆕 <b>নতুন মেস শুরু</b>\n"
+        "/new দিয়ে শুরু করুন। ৩ ধরনের মেস আছে:\n"
+        "  🍽️ Normal — খরচ সবার মধ্যে মাথাপিছু ভাগ হয়\n"
+        "  🎓 Student — প্রতিদিন কে কয়টা মিল খেলো তার হিসাবে খরচ ভাগ হয়\n"
+        "  👤 Personal — শুধু নিজের হিসাব রাখার জন্য\n"
+        "প্রতিটা মেস \"টাইপ মেস #নম্বর\" আকারে দেখা যায় (যেমন Student মেস #1) — নিজের প্রতিটা ধরনের মেস ১ থেকে গোনা হয়।\n\n"
+        "👥 <b>সদস্য যোগ</b>\n"
+        "/adduser দিয়ে @username যোগ করুন (এডমিন)।\n\n"
+        "💰 <b>ডিপোজিট ও খরচ</b>\n"
+        "/deposit — কে কত জমা দিলো তা লিখুন\n"
+        "/addexpense — বাজার/খরচ যোগ করুন\n\n"
+        "🎓 <b>স্টুডেন্ট মেস — মিল হিসাব</b>\n"
+        "প্রতিটা সদস্য /meal_setting দিয়ে নিজের সকাল/দুপুর/রাতের মিল সংখ্যা একবার সেট করে রাখবে (যেমন সকাল ১/২, দুপুর ১, রাত ১)।\n"
+        "প্রতি রাত ১০টায় বট নিজে থেকেই সবার প্রিসেট অনুযায়ী সেদিনের মিল সেভ করে দেয় — এডমিনকে কিছু করতে হয় না।\n"
+        "কারো সেদিন মিল কম/বেশি/অনুপস্থিত থাকলে এডমিন /mill_entry দিয়ে শুধু সেই ব্যতিক্রমটুকু বসিয়ে দিলেই হয় (রাত ১০টার আগে); বাকিদের প্রিসেট অনুযায়ীই থেকে যায়।\n\n"
+        "📊 <b>সারাংশ ও রিপোর্ট</b>\n"
+        "/summary — এখন পর্যন্তের হিসাব (টেক্সট)\n"
+        "/report — ফাইনাল PDF রিপোর্ট (ডিপোজিট, খরচ, সেটেলমেন্ট, স্টুডেন্ট মেসে দৈনিক মিল ব্রেকডাউনসহ)\n"
+        "/history — সাম্প্রতিক লেনদেন\n"
+        "🌙 Normal ও Student মেসে প্রতি রাত ১১টায় প্রতিটা সদস্যকে নিজে থেকেই /summary ও /history পাঠিয়ে দেয় বট (Personal মেসে এটা হয় না)।\n\n"
+        "⚙️ <b>এডমিন</b>\n"
+        "/admin — এডমিন প্যানেল (নতুন এডমিন বানানো, সদস্য রিমুভ)\n"
+        "/endmess — মেস সম্পন্ন করে ফাইনাল রিপোর্ট তৈরি করুন\n\n"
+        "🔀 একাধিক মেসের সাথে যুক্ত থাকলে /start দিয়ে যেকোনো একটায় সুইচ করা যায়।"
+    )
+
+async def guide_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_guide_text(), parse_mode='HTML')
 
 async def mill_entry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mess_id = await _active_mess_or_prompt(update)
@@ -1815,7 +2015,8 @@ async def mill_entry_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     today = datetime.now().strftime("%Y-%m-%d")
     keyboard = [
         [InlineKeyboardButton(f"📅 আজকে ({today})", callback_data=f'mill_date_today|{mess_id}')],
-        [InlineKeyboardButton("🗓️ অন্য তারিখ লিখবো", callback_data=f'mill_date_custom|{mess_id}')]
+        [InlineKeyboardButton("🗓️ অন্য তারিখ লিখবো", callback_data=f'mill_date_custom|{mess_id}')],
+        [InlineKeyboardButton("📖 ব্যবহারবিধি", callback_data='show_guide')]
     ]
     await update.message.reply_text(
         "🍽️ **মিল এন্ট্রি**\n\nকোন তারিখের জন্য মিল এন্ট্রি দিতে চান?",
@@ -1879,14 +2080,14 @@ async def _finish_meal_preset(reply_target, context, mess_id, username):
     total = b + l + d
     context.user_data['meal_values'] = {}
     text = (
-        f"✅ **প্রিসেট সেভ হয়েছে!**\n\n"
-        f"🌅 সকাল {b:g} + ☀️ দুপুর {l:g} + 🌙 রাত {d:g} = **দৈনিক {total:g} মিল**\n\n"
+        f"✅ <b>প্রিসেট সেভ হয়েছে!</b>\n\n"
+        f"🌅 সকাল {b:g} + ☀️ দুপুর {l:g} + 🌙 রাত {d:g} = <b>দৈনিক {total:g} মিল</b>\n\n"
         f"এখন থেকে admin bulk এন্ট্রি করলে এটাই তোমার ডিফল্ট মিল হিসেবে বসবে। বদলাতে চাইলে আবার /meal_setting করো।"
     )
     if hasattr(reply_target, 'edit_message_text'):
-        await reply_target.edit_message_text(text, parse_mode='Markdown')
+        await reply_target.edit_message_text(text, parse_mode='HTML')
     else:
-        await reply_target.reply_text(text, parse_mode='Markdown')
+        await reply_target.reply_text(text, parse_mode='HTML')
 
 async def meal_setting_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mess_id = await _active_mess_or_prompt(update)
@@ -1941,7 +2142,7 @@ async def endmess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "❓ **সাহায্য — সব কমান্ড**\n\n"
+        "❓ <b>সাহায্য — সব কমান্ড</b>\n\n"
         "🏠 /start — বট শুরু করুন বা মেনু দেখুন\n"
         "🆕 /new — নতুন মেস/হিসাব শুরু করুন\n"
         "📂 /myaccounts — আপনার সব মেস দেখুন/পরিবর্তন করুন\n"
@@ -1955,9 +2156,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌅 /meal_setting — নিজের সকাল/দুপুর/রাতের মিল প্রিসেট সেট করুন (স্টুডেন্ট মেস)\n"
         "⚙️ /admin — এডমিন ম্যানেজমেন্ট (এডমিন)\n"
         "🔚 /endmess — মেস শেষ করুন (এডমিন)\n"
+        "📖 /guide — বিস্তারিত ব্যবহারবিধি\n"
         "❓ /help — এই সাহায্য বার্তা\n\n"
         "প্রতিটা মেসের নিজস্ব এডমিন থাকে। যে মেস শুরু করে সে-ই সেই মেসের এডমিন।",
-        parse_mode='Markdown'
+        parse_mode='HTML'
     )
 
 # ============ মেইন ফাংশন ============
@@ -1977,7 +2179,8 @@ async def post_init(application: Application):
         BotCommand("endmess", "🔚 মেস শেষ করুন"),
         BotCommand("myaccounts", "📂 আমার মেসসমূহ"),
         BotCommand("new", "🆕 নতুন মেস শুরু করুন"),
-        BotCommand("help", "❓ সাহায্য")
+        BotCommand("help", "❓ সাহায্য"),
+        BotCommand("guide", "📖 ব্যবহারবিধি")
     ])
 
 def main():
@@ -1998,8 +2201,16 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("endmess", endmess_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("guide", guide_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    if app.job_queue is not None:
+        app.job_queue.run_daily(auto_apply_daily_mills_job, time=dtime(22, 0, tzinfo=BD_TZ), name="auto_apply_daily_mills")
+        app.job_queue.run_daily(auto_nightly_digest_job, time=dtime(23, 0, tzinfo=BD_TZ), name="auto_nightly_digest")
+    else:
+        print("⚠️ job-queue ইনস্টল করা নেই — রাত ১০/১১টার অটো জব চালু হয়নি। requirements.txt-এ 'python-telegram-bot[job-queue]' যোগ করুন।")
+    
     print("🤖 বট চালু হয়েছে...")
     app.run_polling()
 
