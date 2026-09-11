@@ -1352,8 +1352,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split('_')
         mess_id = int(parts[2])
         username = parts[3]
-        if not is_member_or_admin(user_id, mess_id):
-            await query.answer("❌ আপনি এই মেসের সদস্য নন!", show_alert=True)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিন ডিপোজিট যোগ করতে পারবেন!", show_alert=True)
             return
         context.user_data['deposit_user'] = username
         context.user_data['deposit_mess_id'] = mess_id
@@ -1362,8 +1362,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith('deposit_'):
         mess_id = int(data.replace('deposit_', ''))
-        if not is_member_or_admin(user_id, mess_id):
-            await query.answer("❌ আপনি এই মেসের সদস্য নন!", show_alert=True)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিন ডিপোজিট যোগ করতে পারবেন!", show_alert=True)
             return
         if is_mess_completed(mess_id):
             await query.edit_message_text("❌ এই মেস সম্পন্ন হয়েছে! ডিপোজিট করা যাবে না।")
@@ -1853,12 +1853,23 @@ async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mess_id = await _active_mess_or_prompt(update)
     if not mess_id:
         return
+    user_id = update.effective_user.id
+    if not is_admin(user_id, mess_id):
+        await update.message.reply_text("❌ শুধুমাত্র এডমিন ডিপোজিট যোগ করতে পারবেন!")
+        return
     if is_mess_completed(mess_id):
         await update.message.reply_text("❌ এই মেস সম্পন্ন হয়েছে! ডিপোজিট করা যাবে না।")
         return
     users = get_users(mess_id)
     if not users:
         await update.message.reply_text("❌ কোনো ইউজার নেই! আগে /adduser দিয়ে ইউজার যোগ করুন।")
+        return
+    if len(users) == 1:
+        username = users[0][0]
+        context.user_data['deposit_user'] = username
+        context.user_data['deposit_mess_id'] = mess_id
+        context.user_data['action'] = f'deposit_amount_{mess_id}'
+        await update.message.reply_text("💵 জমার পরিমাণ লিখুন (শুধু সংখ্যা):")
         return
     keyboard = []
     for username, full_name in users:
@@ -2015,8 +2026,7 @@ async def mill_entry_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     today = datetime.now().strftime("%Y-%m-%d")
     keyboard = [
         [InlineKeyboardButton(f"📅 আজকে ({today})", callback_data=f'mill_date_today|{mess_id}')],
-        [InlineKeyboardButton("🗓️ অন্য তারিখ লিখবো", callback_data=f'mill_date_custom|{mess_id}')],
-        [InlineKeyboardButton("📖 ব্যবহারবিধি", callback_data='show_guide')]
+        [InlineKeyboardButton("🗓️ অন্য তারিখ লিখবো", callback_data=f'mill_date_custom|{mess_id}')]
     ]
     await update.message.reply_text(
         "🍽️ **মিল এন্ট্রি**\n\nকোন তারিখের জন্য মিল এন্ট্রি দিতে চান?",
