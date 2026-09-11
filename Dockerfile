@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     libraqm0 \
     libfribidi0 \
     libharfbuzz0b \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # ডেটাবেস ফোল্ডার তৈরি
