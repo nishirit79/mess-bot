@@ -340,6 +340,15 @@ def get_users(mess_id):
     conn.close()
     return users
 
+def get_users_full(mess_id):
+    """(username, full_name, user_id) - মেস থেকে মেসে ইউজার কপি করার জন্য"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username, full_name, user_id FROM users WHERE mess_id = ?", (mess_id,))
+    users = c.fetchall()
+    conn.close()
+    return users
+
 def get_users_with_ids(mess_id):
     """(username, user_id) - শুধু যাদের telegram user_id লিংক করা আছে (তাদেরই DM পাঠানো সম্ভব)"""
     conn = sqlite3.connect(DB_PATH)
@@ -442,10 +451,11 @@ def add_deposit(username, amount, mess_id, note=""):
     conn.commit()
     conn.close()
 
-def add_expense(description, amount, mess_id, added_by="System"):
+def add_expense(description, amount, mess_id, added_by="System", date=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d %H:%M")
     c.execute("INSERT INTO expenses (description, amount, date, added_by, mess_id) VALUES (?, ?, ?, ?, ?)", 
              (description, amount, date, added_by, mess_id))
     conn.commit()
@@ -678,7 +688,12 @@ def is_mess_completed(mess_id):
 def complete_mess(mess_id, end_date):
     info = get_mess_info(mess_id)
     if info:
-        save_mess_info(mess_id, info['start_date'], end_date, info['month_name'])
+        save_mess_info(mess_id, info['start_date'], end_date, info['month_name'],
+                        mess_type=info.get('mess_type', 'simple'),
+                        default_mill_count=info.get('default_mill_count', 1.0),
+                        creator_user_id=info.get('creator_user_id'),
+                        type_ordinal=info.get('type_ordinal'),
+                        default_breakfast=info.get('default_breakfast', 1.0))
 
 def generate_pdf_report(mess_id):
     mess_info = get_mess_info(mess_id)
@@ -1098,6 +1113,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
+BENGALI_MONTHS = {
+    1: "জানুয়ারি", 2: "ফেব্রুয়ারি", 3: "মার্চ", 4: "এপ্রিল", 5: "মে", 6: "জুন",
+    7: "জুলাই", 8: "আগস্ট", 9: "সেপ্টেম্বর", 10: "অক্টোবর", 11: "নভেম্বর", 12: "ডিসেম্বর"
+}
+
+def current_month_name():
+    now = datetime.now(BD_TZ)
+    return f"{BENGALI_MONTHS[now.month]} {now.year}"
+
+def get_completed_user_messes(user_id):
+    return [m for m in get_user_messes(user_id) if m['end_date'] != 'চলমান']
+
+async def renew_mess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    completed = [m for m in get_completed_user_messes(user_id) if is_admin(user_id, m['id'])]
+    if not completed:
+        await update.message.reply_text("📭 আপনার কোনো সম্পন্ন হওয়া মেস নেই যেটা থেকে পুনরায় শুরু করা যায়।")
+        return
+    keyboard = []
+    for mess in completed:
+        keyboard.append([InlineKeyboardButton(
+            f"{mess_display_label(mess)} - {mess['month_name']} ({mess['start_date']} - {mess['end_date']})",
+            callback_data=f"renew_pick|{mess['id']}"
+        )])
+    await update.message.reply_text(
+        "🔁 **আগের কোন মেস থেকে একই সদস্যদের নিয়ে নতুন করে শুরু করবেন?**\n\n"
+        "নতুন মেসে হিসাব একদম শূন্য থেকে শুরু হবে, কিন্তু সব সদস্য/এডমিন একই থাকবে। "
+        "শুরুর তারিখ আজকের এবং মাসের নাম এই মাসের হবে — আলাদা করে লিখতে হবে না।",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
 MESS_TYPE_LABELS = {
     'simple': '🍽️ সাধারণ মেস (মাথাপিছু হিসাব)',
     'student': '🎓 স্টুডেন্ট মেস (মিল হিসাব)',
@@ -1385,6 +1432,71 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(f"@{username}", callback_data=f'deposit_user_{mess_id}_{username}')])
         keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data=f'back_main_{mess_id}')])
         await query.edit_message_text("👤 **কে ডিপোজিট করবেন?**", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data.startswith('expense_date_today|'):
+        mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিন খরচ যোগ করতে পারবেন!", show_alert=True)
+            return
+        desc = context.user_data.get('expense_desc')
+        amount = context.user_data.get('expense_amount')
+        add_expense(desc, amount, mess_id, query.from_user.username or "User")
+        await query.edit_message_text(f"✅ '{desc}' খরচ {amount:.2f} টাকা যোগ হয়েছে!\n💰 বর্তমান ব্যালেন্স: {get_balance(mess_id):.2f} টাকা")
+        await show_main_menu(query.message, mess_id, user_id)
+    
+    elif data.startswith('expense_date_custom|'):
+        mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিন খরচ যোগ করতে পারবেন!", show_alert=True)
+            return
+        context.user_data['action'] = f'expense_customdate_{mess_id}'
+        await query.edit_message_text("🗓️ **তারিখ লিখুন** (যেমন: 2026-01-15):")
+    
+    elif data.startswith('renew_pick|'):
+        old_mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, old_mess_id):
+            await query.answer("❌ আপনি এই মেসের এডমিন নন!", show_alert=True)
+            return
+        old_info = get_mess_info(old_mess_id)
+        if not old_info:
+            await query.edit_message_text("❌ পুরনো মেসের তথ্য পাওয়া যায়নি।")
+            return
+        mess_type = old_info.get('mess_type', 'simple')
+        new_mess_id = get_next_mess_id()
+        type_ordinal = get_next_type_ordinal(user_id, mess_type)
+        start_date = datetime.now(BD_TZ).strftime("%Y-%m-%d")
+        month_name = current_month_name()
+        default_breakfast = old_info.get('default_breakfast', 1.0)
+        save_mess_info(new_mess_id, start_date, 'চলমান', month_name, mess_type=mess_type,
+                        creator_user_id=user_id, type_ordinal=type_ordinal, default_breakfast=default_breakfast)
+        
+        # পুরনো মেসের সব এডমিন কপি
+        for admin_uid, admin_username in get_admins(old_mess_id):
+            add_admin(admin_uid, new_mess_id, admin_username)
+        # পুরনো মেসের সব সদস্য কপি (ইউজার আইডি সহ)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT username, full_name, user_id FROM users WHERE mess_id = ?", (old_mess_id,))
+        old_users = c.fetchall()
+        conn.close()
+        for username, full_name, member_user_id in old_users:
+            add_user(username, new_mess_id, full_name=full_name, user_id=member_user_id)
+            if mess_type == 'student':
+                p = get_meal_preset(old_mess_id, username)
+                set_meal_preset(new_mess_id, username, p['breakfast'], p['lunch'], p['dinner'])
+        
+        set_current_mess_id(user_id, new_mess_id)
+        label = mess_display_label(get_mess_info(new_mess_id))
+        await query.edit_message_text(
+            f"✅ **নতুন হিসাব শুরু হয়েছে!**\n\n"
+            f"🆔 {label}\n"
+            f"📅 শুরুর তারিখ: {start_date}\n"
+            f"📌 মাস: {month_name}\n"
+            f"👥 {len(old_users)} জন সদস্য আগের মেস থেকে কপি হয়েছে\n\n"
+            f"হিসাব একদম শূন্য থেকে শুরু হয়েছে।",
+            parse_mode='Markdown'
+        )
+        await show_main_menu(query.message, new_mess_id, user_id)
     
     elif data.startswith('add_expense_'):
         mess_id = int(data.replace('add_expense_', ''))
@@ -1800,13 +1912,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             amount = float(text)
-            desc = context.user_data.get('expense_desc')
-            add_expense(desc, amount, mess_id, update.message.from_user.username or "User")
-            await update.message.reply_text(f"✅ '{desc}' খরচ {amount:.2f} টাকা যোগ হয়েছে!\n💰 বর্তমান ব্যালেন্স: {get_balance(mess_id):.2f} টাকা")
+            context.user_data['expense_amount'] = amount
             context.user_data['action'] = None
-            await show_main_menu(update.message, mess_id, update.effective_user.id)
+            today = datetime.now().strftime("%Y-%m-%d")
+            keyboard = [
+                [InlineKeyboardButton(f"📅 আজকে ({today})", callback_data=f'expense_date_today|{mess_id}')],
+                [InlineKeyboardButton("🗓️ অন্য তারিখ লিখবো", callback_data=f'expense_date_custom|{mess_id}')]
+            ]
+            await update.message.reply_text("📅 কোন তারিখের খরচ এটা?", reply_markup=InlineKeyboardMarkup(keyboard))
         except ValueError:
             await update.message.reply_text("❌ দয়া করে সঠিক সংখ্যা দিন!")
+    
+    elif action.startswith('expense_customdate_'):
+        mess_id = int(action.replace('expense_customdate_', ''))
+        if not is_admin(update.effective_user.id, mess_id):
+            context.user_data['action'] = None
+            return
+        try:
+            expense_date = text.strip()
+            datetime.strptime(expense_date, "%Y-%m-%d")
+            desc = context.user_data.get('expense_desc')
+            amount = context.user_data.get('expense_amount')
+            add_expense(desc, amount, mess_id, update.effective_user.username or "User", date=f"{expense_date} 00:00")
+            context.user_data['action'] = None
+            await update.message.reply_text(
+                f"✅ '{desc}' খরচ {amount:.2f} টাকা যোগ হয়েছে! (তারিখ: {expense_date})\n"
+                f"💰 বর্তমান ব্যালেন্স: {get_balance(mess_id):.2f} টাকা"
+            )
+            await show_main_menu(update.message, mess_id, update.effective_user.id)
+        except ValueError:
+            await update.message.reply_text("❌ ভুল ফরম্যাট! তারিখটি YYYY-MM-DD ফরম্যাটে দিন (যেমন: 2026-01-15)।")
 
 async def myaccounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1982,11 +2117,13 @@ def build_guide_text():
         "  🎓 Student — প্রতিদিন কে কয়টা মিল খেলো তার হিসাবে খরচ ভাগ হয়\n"
         "  👤 Personal — শুধু নিজের হিসাব রাখার জন্য\n"
         "প্রতিটা মেস \"টাইপ মেস #নম্বর\" আকারে দেখা যায় (যেমন Student মেস #1) — নিজের প্রতিটা ধরনের মেস ১ থেকে গোনা হয়।\n\n"
+        "🔁 <b>পুরনো মেস থেকে নতুন করে শুরু (একই সদস্য নিয়ে)</b>\n"
+        "মেস শেষ (/endmess) করার পর নতুন মাসের জন্য আবার শুরু করতে চাইলে /new দিয়ে নতুন করে সব ইউজার যোগ করতে হবে না — /renew দিয়ে আগের কোন মেস থেকে শুরু করবেন বেছে নিলে সেই মেসের সব সদস্য/এডমিন এমনিই চলে আসবে, শুধু হিসাব (ডিপোজিট/খরচ/মিল) শূন্য থেকে শুরু হবে। শুরুর তারিখ ও মাসের নাম অটোমেটিক আজকের দিন/মাস অনুযায়ী বসবে।\n\n"
         "👥 <b>সদস্য যোগ</b>\n"
         "/adduser দিয়ে @username যোগ করুন (এডমিন)।\n\n"
         "💰 <b>ডিপোজিট ও খরচ</b>\n"
-        "/deposit — কে কত জমা দিলো তা লিখুন\n"
-        "/addexpense — বাজার/খরচ যোগ করুন\n\n"
+        "/deposit — কে কত জমা দিলো তা লিখুন (এডমিন)\n"
+        "/addexpense — বাজার/খরচ যোগ করুন (এডমিন) — টাকার পরিমাণ লেখার পর তারিখ হিসেবে আজকে অথবা অন্য কোনো তারিখ বেছে নেওয়া যায়\n\n"
         "🎓 <b>স্টুডেন্ট মেস — মিল হিসাব</b>\n"
         "প্রতিটা সদস্য /meal_setting দিয়ে নিজের সকাল/দুপুর/রাতের মিল সংখ্যা একবার সেট করে রাখবে (যেমন সকাল ১/২, দুপুর ১, রাত ১)।\n"
         "প্রতি রাত ১০টায় বট নিজে থেকেই সবার প্রিসেট অনুযায়ী সেদিনের মিল সেভ করে দেয় — এডমিনকে কিছু করতে হয় না।\n"
@@ -2155,6 +2292,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❓ <b>সাহায্য — সব কমান্ড</b>\n\n"
         "🏠 /start — বট শুরু করুন বা মেনু দেখুন\n"
         "🆕 /new — নতুন মেস/হিসাব শুরু করুন\n"
+        "🔁 /renew — আগের শেষ হওয়া মেস থেকে (একই সদস্য নিয়ে) নতুন হিসাব শুরু করুন\n"
         "📂 /myaccounts — আপনার সব মেস দেখুন/পরিবর্তন করুন\n"
         "👥 /adduser — ইউজার যোগ করুন (এডমিন)\n"
         "💰 /deposit — ডিপোজিট করুন\n"
@@ -2189,6 +2327,7 @@ async def post_init(application: Application):
         BotCommand("endmess", "🔚 মেস শেষ করুন"),
         BotCommand("myaccounts", "📂 আমার মেসসমূহ"),
         BotCommand("new", "🆕 নতুন মেস শুরু করুন"),
+        BotCommand("renew", "🔁 আগের মেস থেকে (একই সদস্য) নতুন শুরু"),
         BotCommand("help", "❓ সাহায্য"),
         BotCommand("guide", "📖 ব্যবহারবিধি")
     ])
@@ -2199,6 +2338,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new_mess))
+    app.add_handler(CommandHandler("renew", renew_mess_command))
     app.add_handler(CommandHandler("myaccounts", myaccounts_command))
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("deposit", deposit_command))
