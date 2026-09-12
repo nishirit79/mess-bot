@@ -1122,6 +1122,61 @@ def current_month_name():
     now = datetime.now(BD_TZ)
     return f"{BENGALI_MONTHS[now.month]} {now.year}"
 
+def month_name_for_date(date_str):
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+    return f"{BENGALI_MONTHS[d.month]} {d.year}"
+
+async def ask_new_mess_date(query, context, edit=True, prefix=""):
+    today = datetime.now(BD_TZ).strftime("%Y-%m-%d")
+    keyboard = [
+        [InlineKeyboardButton(f"📅 আজকে ({today})", callback_data='newmess_date_today')],
+        [InlineKeyboardButton("🗓️ অন্য তারিখ লিখবো", callback_data='newmess_date_custom')]
+    ]
+    text = f"{prefix}📅 **মেস কবে থেকে শুরু হবে?**\n(মাসের নাম শুরুর তারিখ অনুযায়ী অটোমেটিক বসে যাবে)"
+    if edit:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await query.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def finalize_new_mess(reply_target, context, tg_user, start_date, via_edit=False):
+    """tg_user: telegram.User object (has .id, .username, .first_name)"""
+    user_id = tg_user.id
+    mess_type = context.user_data.get('new_mess_type', 'simple')
+    month_name = month_name_for_date(start_date)
+    mess_id = get_next_mess_id()
+    type_ordinal = get_next_type_ordinal(user_id, mess_type)
+    default_breakfast = context.user_data.get('new_mess_breakfast', 1.0)
+    save_mess_info(mess_id, start_date, 'চলমান', month_name, mess_type=mess_type,
+                    creator_user_id=user_id, type_ordinal=type_ordinal, default_breakfast=default_breakfast)
+    tg_username = tg_user.username or tg_user.first_name
+    add_admin(user_id, mess_id, tg_username)
+    add_user(tg_username, mess_id, user_id=user_id)
+    set_current_mess_id(user_id, mess_id)
+    context.user_data['new_mess_type'] = None
+    context.user_data['new_mess_breakfast'] = None
+    label = mess_display_label(get_mess_info(mess_id))
+    extra_hint = ""
+    if mess_type == 'student':
+        extra_hint = "\n\n📌 প্রতিদিন মিল এন্ট্রি দিতে /mill_entry কমান্ড ব্যবহার করুন।"
+    elif mess_type == 'personal':
+        extra_hint = "\n\n📌 এটি আপনার ব্যক্তিগত হিসাব — শুধু আপনার ডিপোজিট/খরচ যোগ করুন।"
+    confirm_text = (
+        f"✅ নতুন মেস শুরু হয়েছে!\n\n"
+        f"🆔 মেস\n{label}\n"
+        f"📅 শুরুর তারিখ: {start_date}\n"
+        f"📌 মাস: {month_name}\n"
+        f"🏷️ ধরন: {MESS_TYPE_LABELS.get(mess_type, mess_type)}\n"
+        f"👑 আপনি এই মেসের এডমিন\n"
+        f"💰 বর্তমান ব্যালেন্স: 0.00 টাকা\n\n"
+        f"এখন ইউজার যোগ করুন এবং ডিপোজিট শুরু করুন!{extra_hint}"
+    )
+    if via_edit:
+        await reply_target.edit_message_text(confirm_text)
+        await show_main_menu(reply_target.message, mess_id, user_id)
+    else:
+        await reply_target.reply_text(confirm_text)
+        await show_main_menu(reply_target, mess_id, user_id)
+
 def get_completed_user_messes(user_id):
     return [m for m in get_user_messes(user_id) if m['end_date'] != 'চলমান']
 
@@ -1184,7 +1239,7 @@ async def show_main_menu(message, mess_id, user_id=None):
     
     await message.reply_text(
         f"📆 **মেস ইনফো**\n"
-        f"🆔 {mess_display_label(mess_info)}\n"
+        f"🆔 মেস\n{mess_display_label(mess_info)}\n"
         f"🏷️ ধরন: {type_label}\n"
         f"📅 শুরু: {mess_info['start_date']}\n"
         f"📅 শেষ: {mess_info['end_date']}\n"
@@ -1222,22 +1277,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         else:
-            await query.edit_message_text(
-                f"✅ ধরন: {MESS_TYPE_LABELS.get(mess_type, mess_type)}\n\n"
-                f"📅 **মেস শুরুর তারিখ লিখুন** (যেমন: 2026-01-01):",
-                parse_mode='Markdown'
-            )
-            context.user_data['action'] = 'new_mess_date'
+            await ask_new_mess_date(query, context, edit=True)
     
     elif data.startswith('newmess_bf|'):
         value = float(data.split('|')[1])
         context.user_data['new_mess_breakfast'] = value
-        await query.edit_message_text(
-            f"✅ সকালের ডিফল্ট মিল: {value:g}\n\n"
-            f"📅 **মেস শুরুর তারিখ লিখুন** (যেমন: 2026-01-01):",
-            parse_mode='Markdown'
-        )
-        context.user_data['action'] = 'new_mess_date'
+        await ask_new_mess_date(query, context, edit=True, prefix=f"✅ সকালের ডিফল্ট মিল: {value:g}\n\n")
+    
+    elif data == 'newmess_date_today':
+        today = datetime.now(BD_TZ).strftime("%Y-%m-%d")
+        user_obj = query.from_user
+        await finalize_new_mess(query, context, user_obj, today, via_edit=True)
+    
+    elif data == 'newmess_date_custom':
+        context.user_data['action'] = 'new_mess_customdate'
+        await query.edit_message_text("🗓️ **তারিখ লিখুন** (যেমন: 2026-01-15):", parse_mode='Markdown')
     
     elif data == 'old_messes':
         messes = get_user_messes(user_id)
@@ -1489,7 +1543,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = mess_display_label(get_mess_info(new_mess_id))
         await query.edit_message_text(
             f"✅ **নতুন হিসাব শুরু হয়েছে!**\n\n"
-            f"🆔 {label}\n"
+            f"🆔 মেস\n{label}\n"
             f"📅 শুরুর তারিখ: {start_date}\n"
             f"📌 মাস: {month_name}\n"
             f"👥 {len(old_users)} জন সদস্য আগের মেস থেকে কপি হয়েছে\n\n"
@@ -1659,7 +1713,7 @@ def build_summary_text(mess_id):
         return None
     
     text = f"📊 **মেসের সারাংশ**\n"
-    text += f"🆔 {mess_display_label(mess_info)}\n"
+    text += f"🆔 মেস\n{mess_display_label(mess_info)}\n"
     text += f"📅 মাস: {mess_info['month_name']}\n"
     text += f"📅 সময়কাল: {mess_info['start_date']} - {mess_info['end_date']}\n"
     text += "="*30 + "\n\n"
@@ -1761,50 +1815,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not action:
         return
     
-    if action == 'new_mess_date':
+    if action == 'new_mess_customdate':
         try:
-            start_date = text
+            start_date = text.strip()
             datetime.strptime(start_date, "%Y-%m-%d")
-            context.user_data['new_mess_date'] = start_date
-            context.user_data['action'] = 'new_mess_month'
-            await update.message.reply_text("📌 **মাসের নাম লিখুন:**\nযেমন: জানুয়ারি ২০২৬")
+            context.user_data['action'] = None
+            await finalize_new_mess(update.message, context, update.effective_user, start_date, via_edit=False)
         except ValueError:
-            await update.message.reply_text("❌ ভুল ফরম্যাট! তারিখটি YYYY-MM-DD ফরম্যাটে দিন।")
-    
-    elif action == 'new_mess_month':
-        month_name = text
-        start_date = context.user_data['new_mess_date']
-        mess_type = context.user_data.get('new_mess_type', 'simple')
-        mess_id = get_next_mess_id()
-        user_id = update.effective_user.id
-        type_ordinal = get_next_type_ordinal(user_id, mess_type)
-        default_breakfast = context.user_data.get('new_mess_breakfast', 1.0)
-        save_mess_info(mess_id, start_date, 'চলমান', month_name, mess_type=mess_type,
-                        creator_user_id=user_id, type_ordinal=type_ordinal, default_breakfast=default_breakfast)
-        tg_username = update.effective_user.username or update.effective_user.first_name
-        add_admin(user_id, mess_id, tg_username)
-        add_user(tg_username, mess_id, user_id=user_id)
-        set_current_mess_id(user_id, mess_id)
-        context.user_data['action'] = None
-        context.user_data['new_mess_type'] = None
-        context.user_data['new_mess_breakfast'] = None
-        label = mess_display_label(get_mess_info(mess_id))
-        extra_hint = ""
-        if mess_type == 'student':
-            extra_hint = "\n\n📌 প্রতিদিন মিল এন্ট্রি দিতে /mill_entry কমান্ড ব্যবহার করুন।"
-        elif mess_type == 'personal':
-            extra_hint = "\n\n📌 এটি আপনার ব্যক্তিগত হিসাব — শুধু আপনার ডিপোজিট/খরচ যোগ করুন।"
-        await update.message.reply_text(
-            f"✅ **নতুন মেস শুরু হয়েছে!**\n\n"
-            f"🆔 {label}\n"
-            f"📅 শুরুর তারিখ: {start_date}\n"
-            f"📌 মাস: {month_name}\n"
-            f"🏷️ ধরন: {MESS_TYPE_LABELS.get(mess_type, mess_type)}\n"
-            f"👑 আপনি এই মেসের এডমিন\n"
-            f"💰 বর্তমান ব্যালেন্স: 0.00 টাকা\n\n"
-            f"এখন ইউজার যোগ করুন এবং ডিপোজিট শুরু করুন!{extra_hint}"
-        )
-        await show_main_menu(update.message, mess_id, user_id)
+            await update.message.reply_text("❌ ভুল ফরম্যাট! তারিখটি YYYY-MM-DD ফরম্যাটে দিন (যেমন: 2026-01-15)।")
     
     elif action.startswith('end_mess_'):
         mess_id = int(action.replace('end_mess_', ''))
