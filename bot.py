@@ -279,6 +279,7 @@ def get_next_type_ordinal(creator_user_id, mess_type):
     return count + 1
 
 MESS_TYPE_SHORT = {'simple': 'Normal', 'student': 'Student', 'personal': 'Personal'}
+MESS_TYPE_SORT_ORDER = {'simple': 0, 'student': 1, 'personal': 2}
 
 def mess_display_label(mess_info):
     """ইউজারকে দেখানোর জন্য - যেমন 'Student মেস #1' - যাতে প্রতিটা ইউজার নিজের মতো ১ থেকে শুরু করা মেস নম্বর দেখে"""
@@ -288,6 +289,13 @@ def mess_display_label(mess_info):
     if ordinal:
         return f"{short} মেস #{ordinal}"
     return f"{short} মেস"
+
+def sort_messes_grouped_by_type(messes):
+    """তালিকায় Normal-এর সব মেস আগে, তারপর Student, তারপর Personal - প্রতি গ্রুপে সাম্প্রতিকটা আগে"""
+    return sorted(
+        messes,
+        key=lambda m: (MESS_TYPE_SORT_ORDER.get(m.get('mess_type', 'simple'), 99), -(m.get('type_ordinal') or 0))
+    )
 
 def get_all_messes():
     conn = sqlite3.connect(DB_PATH)
@@ -810,6 +818,40 @@ def generate_pdf_report(mess_id):
     story.append(summary_table)
     story.append(Spacer(1, 20))
     
+    # খরচের বিবরণ (তারিখ, বিবরণ, পরিমাণ) — সব ধরনের মেসেই দেখানো হয়
+    if expenses:
+        story.append(bn_text("খরচের বিবরণ", size=13, bold=True))
+        story.append(Spacer(1, 10))
+        
+        expense_data = [[bn_text("তারিখ", size=10, bold=True, color=(255, 255, 255)),
+                         bn_text("বিবরণ", size=10, bold=True, color=(255, 255, 255)),
+                         bn_text("পরিমাণ (টাকা)", size=10, bold=True, color=(255, 255, 255)),
+                         bn_text("যোগ করেছেন", size=10, bold=True, color=(255, 255, 255))]]
+        for description, amount, exp_date, added_by in expenses:
+            date_only = exp_date.split(' ')[0] if exp_date else ''
+            expense_data.append([date_only, bn_text(str(description), size=9), f"{amount:.2f}", f"@{added_by}" if added_by else ''])
+        expense_data.append([bn_text("সর্বমোট", size=10, bold=True), "", bn_text(f"{total_exp:.2f}", size=10, bold=True), ""])
+        
+        expense_table = Table(expense_data, colWidths=[1*inch, 2.3*inch, 1.2*inch, 1*inch])
+        expense_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#a04000')),
+            ('ALIGN', (0, 0), (0, -1), 'CENTER'),
+            ('ALIGN', (2, 0), (-1, -1), 'CENTER'),
+            ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('BACKGROUND', (0, 1), (-1, -2), colors.HexColor('#fdf2e9')),
+            ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#f5cba7')),
+            ('SPAN', (0, -1), (1, -1)),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.HexColor('#fef9f4'), colors.HexColor('#fdf2e9')])
+        ]))
+        story.append(expense_table)
+        story.append(Spacer(1, 20))
+    
     # হিসাব (কে ফেরত পাবে / কাকে দিতে হবে) — mess_type অনুযায়ী মাথাপিছু বা মিল-ভিত্তিক
     if users:
         if mess_type == 'student':
@@ -1076,7 +1118,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update.message, active_mess_id, user_id)
         return
 
-    my_messes = get_user_messes(user_id)
+    my_messes = sort_messes_grouped_by_type(get_user_messes(user_id))
 
     if len(my_messes) == 1:
         set_current_mess_id(user_id, my_messes[0]['id'])
@@ -1156,19 +1198,20 @@ async def finalize_new_mess(reply_target, context, tg_user, start_date, via_edit
     context.user_data['new_mess_breakfast'] = None
     label = mess_display_label(get_mess_info(mess_id))
     extra_hint = ""
+    closing_line = "এখন ইউজার যোগ করুন এবং ডিপোজিট শুরু করুন!"
     if mess_type == 'student':
         extra_hint = "\n\n📌 প্রতিদিন মিল এন্ট্রি দিতে /mill_entry কমান্ড ব্যবহার করুন।"
     elif mess_type == 'personal':
-        extra_hint = "\n\n📌 এটি আপনার ব্যক্তিগত হিসাব — শুধু আপনার ডিপোজিট/খরচ যোগ করুন।"
+        closing_line = "এখনই /addexpense বা /deposit দিয়ে নিজের হিসাব লেখা শুরু করুন — আলাদা ইউজার যোগ করার দরকার নেই।"
     confirm_text = (
         f"✅ নতুন মেস শুরু হয়েছে!\n\n"
-        f"🆔 মেস\n{label}\n"
+        f"🆔 মেস: {label}\n"
         f"📅 শুরুর তারিখ: {start_date}\n"
         f"📌 মাস: {month_name}\n"
         f"🏷️ ধরন: {MESS_TYPE_LABELS.get(mess_type, mess_type)}\n"
         f"👑 আপনি এই মেসের এডমিন\n"
         f"💰 বর্তমান ব্যালেন্স: 0.00 টাকা\n\n"
-        f"এখন ইউজার যোগ করুন এবং ডিপোজিট শুরু করুন!{extra_hint}"
+        f"{closing_line}{extra_hint}"
     )
     if via_edit:
         await reply_target.edit_message_text(confirm_text)
@@ -1177,12 +1220,54 @@ async def finalize_new_mess(reply_target, context, tg_user, start_date, via_edit
         await reply_target.reply_text(confirm_text)
         await show_main_menu(reply_target, mess_id, user_id)
 
+async def finalize_renew(reply_target, context, user_id, old_mess_id, start_date, via_edit=False):
+    old_info = get_mess_info(old_mess_id)
+    mess_type = old_info.get('mess_type', 'simple')
+    new_mess_id = get_next_mess_id()
+    type_ordinal = get_next_type_ordinal(user_id, mess_type)
+    month_name = month_name_for_date(start_date)
+    default_breakfast = old_info.get('default_breakfast', 1.0)
+    save_mess_info(new_mess_id, start_date, 'চলমান', month_name, mess_type=mess_type,
+                    creator_user_id=user_id, type_ordinal=type_ordinal, default_breakfast=default_breakfast)
+    
+    # পুরনো মেসের সব এডমিন কপি
+    for admin_uid, admin_username in get_admins(old_mess_id):
+        add_admin(admin_uid, new_mess_id, admin_username)
+    # পুরনো মেসের সব সদস্য কপি (ইউজার আইডি সহ)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username, full_name, user_id FROM users WHERE mess_id = ?", (old_mess_id,))
+    old_users = c.fetchall()
+    conn.close()
+    for username, full_name, member_user_id in old_users:
+        add_user(username, new_mess_id, full_name=full_name, user_id=member_user_id)
+        if mess_type == 'student':
+            p = get_meal_preset(old_mess_id, username)
+            set_meal_preset(new_mess_id, username, p['breakfast'], p['lunch'], p['dinner'])
+    
+    set_current_mess_id(user_id, new_mess_id)
+    label = mess_display_label(get_mess_info(new_mess_id))
+    confirm_text = (
+        f"✅ নতুন হিসাব শুরু হয়েছে!\n\n"
+        f"🆔 মেস: {label}\n"
+        f"📅 শুরুর তারিখ: {start_date}\n"
+        f"📌 মাস: {month_name}\n"
+        f"👥 {len(old_users)} জন সদস্য আগের মেস থেকে কপি হয়েছে\n\n"
+        f"হিসাব একদম শূন্য থেকে শুরু হয়েছে।"
+    )
+    if via_edit:
+        await reply_target.edit_message_text(confirm_text)
+        await show_main_menu(reply_target.message, new_mess_id, user_id)
+    else:
+        await reply_target.reply_text(confirm_text)
+        await show_main_menu(reply_target, new_mess_id, user_id)
+
 def get_completed_user_messes(user_id):
     return [m for m in get_user_messes(user_id) if m['end_date'] != 'চলমান']
 
 async def renew_mess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    completed = [m for m in get_completed_user_messes(user_id) if is_admin(user_id, m['id'])]
+    completed = sort_messes_grouped_by_type([m for m in get_completed_user_messes(user_id) if is_admin(user_id, m['id'])])
     if not completed:
         await update.message.reply_text("📭 আপনার কোনো সম্পন্ন হওয়া মেস নেই যেটা থেকে পুনরায় শুরু করা যায়।")
         return
@@ -1195,7 +1280,7 @@ async def renew_mess_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         "🔁 **আগের কোন মেস থেকে একই সদস্যদের নিয়ে নতুন করে শুরু করবেন?**\n\n"
         "নতুন মেসে হিসাব একদম শূন্য থেকে শুরু হবে, কিন্তু সব সদস্য/এডমিন একই থাকবে। "
-        "শুরুর তারিখ আজকের এবং মাসের নাম এই মাসের হবে — আলাদা করে লিখতে হবে না।",
+        "শুরুর তারিখ পরের ধাপে বেছে নিতে পারবেন (আজকে অথবা অন্য কোনো তারিখ), মাসের নাম সেই তারিখ অনুযায়ী অটোমেটিক বসবে।",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
@@ -1239,7 +1324,7 @@ async def show_main_menu(message, mess_id, user_id=None):
     
     await message.reply_text(
         f"📆 **মেস ইনফো**\n"
-        f"🆔 মেস\n{mess_display_label(mess_info)}\n"
+        f"🆔 মেস: {mess_display_label(mess_info)}\n"
         f"🏷️ ধরন: {type_label}\n"
         f"📅 শুরু: {mess_info['start_date']}\n"
         f"📅 শেষ: {mess_info['end_date']}\n"
@@ -1294,7 +1379,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🗓️ **তারিখ লিখুন** (যেমন: 2026-01-15):", parse_mode='Markdown')
     
     elif data == 'old_messes':
-        messes = get_user_messes(user_id)
+        messes = sort_messes_grouped_by_type(get_user_messes(user_id))
         if not messes:
             await query.edit_message_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /start দিয়ে নতুন শুরু করুন।")
             return
@@ -1446,6 +1531,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_mess_completed(mess_id):
             await query.edit_message_text("❌ এই মেস সম্পন্ন হয়েছে! নতুন ইউজার যোগ করা যাবে না।")
             return
+        if get_mess_info(mess_id).get('mess_type') == 'personal':
+            await query.edit_message_text("❌ এটি একটি ব্যক্তিগত (Personal) হিসাব — এখানে আলাদা ইউজার যোগ করার দরকার নেই।")
+            return
         context.user_data['action'] = f'add_user_{mess_id}'
         await query.edit_message_text("👤 **ইউজার যোগ করুন**\n\n@username লিখুন (যেমন: @rahim):")
     
@@ -1515,42 +1603,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not old_info:
             await query.edit_message_text("❌ পুরনো মেসের তথ্য পাওয়া যায়নি।")
             return
-        mess_type = old_info.get('mess_type', 'simple')
-        new_mess_id = get_next_mess_id()
-        type_ordinal = get_next_type_ordinal(user_id, mess_type)
-        start_date = datetime.now(BD_TZ).strftime("%Y-%m-%d")
-        month_name = current_month_name()
-        default_breakfast = old_info.get('default_breakfast', 1.0)
-        save_mess_info(new_mess_id, start_date, 'চলমান', month_name, mess_type=mess_type,
-                        creator_user_id=user_id, type_ordinal=type_ordinal, default_breakfast=default_breakfast)
-        
-        # পুরনো মেসের সব এডমিন কপি
-        for admin_uid, admin_username in get_admins(old_mess_id):
-            add_admin(admin_uid, new_mess_id, admin_username)
-        # পুরনো মেসের সব সদস্য কপি (ইউজার আইডি সহ)
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT username, full_name, user_id FROM users WHERE mess_id = ?", (old_mess_id,))
-        old_users = c.fetchall()
-        conn.close()
-        for username, full_name, member_user_id in old_users:
-            add_user(username, new_mess_id, full_name=full_name, user_id=member_user_id)
-            if mess_type == 'student':
-                p = get_meal_preset(old_mess_id, username)
-                set_meal_preset(new_mess_id, username, p['breakfast'], p['lunch'], p['dinner'])
-        
-        set_current_mess_id(user_id, new_mess_id)
-        label = mess_display_label(get_mess_info(new_mess_id))
+        today = datetime.now(BD_TZ).strftime("%Y-%m-%d")
+        keyboard = [
+            [InlineKeyboardButton(f"📅 আজকে ({today})", callback_data=f'renew_date_today|{old_mess_id}')],
+            [InlineKeyboardButton("🗓️ অন্য তারিখ লিখবো", callback_data=f'renew_date_custom|{old_mess_id}')]
+        ]
         await query.edit_message_text(
-            f"✅ **নতুন হিসাব শুরু হয়েছে!**\n\n"
-            f"🆔 মেস\n{label}\n"
-            f"📅 শুরুর তারিখ: {start_date}\n"
-            f"📌 মাস: {month_name}\n"
-            f"👥 {len(old_users)} জন সদস্য আগের মেস থেকে কপি হয়েছে\n\n"
-            f"হিসাব একদম শূন্য থেকে শুরু হয়েছে।",
+            f"✅ {mess_display_label(old_info)} থেকে সদস্য কপি হবে\n\n"
+            f"📅 **নতুন হিসাব কবে থেকে শুরু হবে?**\n(মাসের নাম শুরুর তারিখ অনুযায়ী অটোমেটিক বসে যাবে)",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
-        await show_main_menu(query.message, new_mess_id, user_id)
+    
+    elif data.startswith('renew_date_today|'):
+        old_mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, old_mess_id):
+            await query.answer("❌ আপনি এই মেসের এডমিন নন!", show_alert=True)
+            return
+        today = datetime.now(BD_TZ).strftime("%Y-%m-%d")
+        await finalize_renew(query, context, user_id, old_mess_id, today, via_edit=True)
+    
+    elif data.startswith('renew_date_custom|'):
+        old_mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, old_mess_id):
+            await query.answer("❌ আপনি এই মেসের এডমিন নন!", show_alert=True)
+            return
+        context.user_data['action'] = f'renew_customdate|{old_mess_id}'
+        await query.edit_message_text("🗓️ **তারিখ লিখুন** (যেমন: 2026-01-15):", parse_mode='Markdown')
     
     elif data.startswith('add_expense_'):
         mess_id = int(data.replace('add_expense_', ''))
@@ -1673,6 +1752,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await show_history(query, mess_id)
     
+    elif data.startswith('gen_report|'):
+        mess_id = int(data.split('|')[1])
+        if not is_member_or_admin(user_id, mess_id):
+            await query.answer("❌ আপনি এই মেসের সদস্য নন!", show_alert=True)
+            return
+        await query.edit_message_text("⏳ **PDF রিপোর্ট তৈরি হচ্ছে...** দয়া করে অপেক্ষা করুন।")
+        try:
+            pdf_buffer = generate_pdf_report(mess_id)
+            await query.message.reply_document(
+                document=pdf_buffer,
+                filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                caption=f"📄 {mess_display_label(get_mess_info(mess_id))} এর ফাইনাল রিপোর্ট"
+            )
+            await query.delete_message()
+        except Exception as e:
+            await query.edit_message_text(f"❌ PDF তৈরি করতে সমস্যা হয়েছে: {str(e)}")
+    
     elif data.startswith('pdf_report_'):
         mess_id = int(data.replace('pdf_report_', ''))
         if not is_member_or_admin(user_id, mess_id):
@@ -1713,7 +1809,7 @@ def build_summary_text(mess_id):
         return None
     
     text = f"📊 **মেসের সারাংশ**\n"
-    text += f"🆔 মেস\n{mess_display_label(mess_info)}\n"
+    text += f"🆔 মেস: {mess_display_label(mess_info)}\n"
     text += f"📅 মাস: {mess_info['month_name']}\n"
     text += f"📅 সময়কাল: {mess_info['start_date']} - {mess_info['end_date']}\n"
     text += "="*30 + "\n\n"
@@ -1821,6 +1917,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             datetime.strptime(start_date, "%Y-%m-%d")
             context.user_data['action'] = None
             await finalize_new_mess(update.message, context, update.effective_user, start_date, via_edit=False)
+        except ValueError:
+            await update.message.reply_text("❌ ভুল ফরম্যাট! তারিখটি YYYY-MM-DD ফরম্যাটে দিন (যেমন: 2026-01-15)।")
+    
+    elif action.startswith('renew_customdate|'):
+        old_mess_id = int(action.split('|')[1])
+        if not is_admin(update.effective_user.id, old_mess_id):
+            context.user_data['action'] = None
+            return
+        try:
+            start_date = text.strip()
+            datetime.strptime(start_date, "%Y-%m-%d")
+            context.user_data['action'] = None
+            await finalize_renew(update.message, context, update.effective_user.id, old_mess_id, start_date, via_edit=False)
         except ValueError:
             await update.message.reply_text("❌ ভুল ফরম্যাট! তারিখটি YYYY-MM-DD ফরম্যাটে দিন (যেমন: 2026-01-15)।")
     
@@ -1963,7 +2072,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def myaccounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    messes = get_user_messes(user_id)
+    messes = sort_messes_grouped_by_type(get_user_messes(user_id))
     if not messes:
         await update.message.reply_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন।")
         return
@@ -1971,7 +2080,7 @@ async def myaccounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for mess in messes:
         status = "✅" if mess['end_date'] != 'চলমান' else "🟢"
         keyboard.append([InlineKeyboardButton(
-            f"{status} #{mess['id']} - {mess['month_name']}",
+            f"{status} {mess_display_label(mess)} - {mess['month_name']}",
             callback_data=f'switch_mess_{mess["id"]}'
         )])
     keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
@@ -1998,6 +2107,10 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if is_mess_completed(mess_id):
         await update.message.reply_text("❌ এই মেস সম্পন্ন হয়েছে! নতুন ইউজার যোগ করা যাবে না।")
+        return
+    mess_info = get_mess_info(mess_id)
+    if mess_info.get('mess_type') == 'personal':
+        await update.message.reply_text("❌ এটি একটি ব্যক্তিগত (Personal) হিসাব — এখানে আলাদা ইউজার যোগ করার দরকার নেই, শুধু আপনার নিজের হিসাবই থাকে।")
         return
     context.user_data['action'] = f'add_user_{mess_id}'
     await update.message.reply_text("👤 **ইউজার যোগ করুন**\n\n@username লিখুন (যেমন: @rahim):")
@@ -2057,19 +2170,41 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(build_history_text(mess_id))
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mess_id = await _active_mess_or_prompt(update)
-    if not mess_id:
+    user_id = update.effective_user.id
+    messes = sort_messes_grouped_by_type(get_user_messes(user_id))
+    if not messes:
+        await update.message.reply_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন।")
         return
-    await update.message.reply_text("⏳ **PDF রিপোর্ট তৈরি হচ্ছে...** দয়া করে অপেক্ষা করুন।")
+    active_mess_id = get_current_mess_id(user_id)
+    if len(messes) == 1:
+        await _generate_and_send_report(update.message, messes[0]['id'])
+        return
+    keyboard = []
+    for mess in messes:
+        status = "🟢" if mess['end_date'] == 'চলমান' else "✅"
+        current_tag = " (চলমান)" if mess['id'] == active_mess_id else ""
+        keyboard.append([InlineKeyboardButton(
+            f"{status} {mess_display_label(mess)} - {mess['month_name']}{current_tag}",
+            callback_data=f'gen_report|{mess["id"]}'
+        )])
+    await update.message.reply_text(
+        "📄 **কোন মেসের জন্য PDF রিপোর্ট চান?**",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+async def _generate_and_send_report(message, mess_id):
+    status_msg = await message.reply_text("⏳ **PDF রিপোর্ট তৈরি হচ্ছে...** দয়া করে অপেক্ষা করুন।")
     try:
         pdf_buffer = generate_pdf_report(mess_id)
-        await update.message.reply_document(
+        await message.reply_document(
             document=pdf_buffer,
             filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
             caption=f"📄 {mess_display_label(get_mess_info(mess_id))} এর ফাইনাল রিপোর্ট"
         )
+        await status_msg.delete()
     except Exception as e:
-        await update.message.reply_text(f"❌ PDF তৈরি করতে সমস্যা হয়েছে: {str(e)}")
+        await status_msg.edit_text(f"❌ PDF তৈরি করতে সমস্যা হয়েছে: {str(e)}")
 
 MILL_QUICK_VALUES = [("নাই", "0"), ("হাফ", "0_5"), ("১", "1"), ("দেড়", "1_5"), ("২", "2")]
 
@@ -2148,7 +2283,7 @@ def build_guide_text():
         "কারো সেদিন মিল কম/বেশি/অনুপস্থিত থাকলে এডমিন /mill_entry দিয়ে শুধু সেই ব্যতিক্রমটুকু বসিয়ে দিলেই হয় (রাত ১০টার আগে); বাকিদের প্রিসেট অনুযায়ীই থেকে যায়।\n\n"
         "📊 <b>সারাংশ ও রিপোর্ট</b>\n"
         "/summary — এখন পর্যন্তের হিসাব (টেক্সট)\n"
-        "/report — ফাইনাল PDF রিপোর্ট (ডিপোজিট, খরচ, সেটেলমেন্ট, স্টুডেন্ট মেসে দৈনিক মিল ব্রেকডাউনসহ)\n"
+        "/report — ফাইনাল PDF রিপোর্ট (কোন মেসের জন্য চান জিজ্ঞেস করবে — চলমান বা আগের যেকোনো মেস বেছে নেওয়া যায়)\n"
         "/history — সাম্প্রতিক লেনদেন\n"
         "🌙 Normal ও Student মেসে প্রতি রাত ১১টায় প্রতিটা সদস্যকে নিজে থেকেই /summary ও /history পাঠিয়ে দেয় বট (Personal মেসে এটা হয় না)।\n\n"
         "⚙️ <b>এডমিন</b>\n"
