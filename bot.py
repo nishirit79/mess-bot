@@ -2,7 +2,7 @@ import os
 import sqlite3
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
@@ -1331,8 +1331,9 @@ async def show_main_menu(message, mess_id, user_id=None):
         f"📌 মাস: {mess_info['month_name']}\n"
         f"📊 স্ট্যাটাস: {status}\n"
         f"💰 ব্যালেন্স: {get_balance(mess_id):.2f} টাকা\n\n"
-        f"👇 নিচের মেনু (⌨️ আইকন) থেকে কমান্ড বেছে নিন।",
-        parse_mode='Markdown'
+        f"👇 নিচের মেনু থেকে বেছে নিন।",
+        parse_mode='Markdown',
+        reply_markup=build_main_reply_keyboard()
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1906,6 +1907,12 @@ async def show_history(query, mess_id):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    
+    if text in MENU_BUTTON_ACTIONS:
+        context.user_data['action'] = None
+        await MENU_BUTTON_ACTIONS[text](update, context)
+        return
+    
     action = context.user_data.get('action')
     
     if not action:
@@ -2484,6 +2491,32 @@ async def post_init(application: Application):
         BotCommand("help", "❓ সাহায্য"),
         BotCommand("guide", "📖 ব্যবহারবিধি")
     ])
+
+MENU_BUTTON_ROWS = [
+    ["📊 সারাংশ", "💰 ডিপোজিট", "💸 খরচ"],
+    ["🍽️ মিল এন্ট্রি", "🌅 মিল প্রিসেট", "📄 রিপোর্ট"],
+    ["📋 হিস্টোরি", "⚙️ এডমিন", "📂 আমার মেস"],
+    ["🆕 নতুন মেস", "🔁 রিনিউ", "📖 গাইড"],
+]
+
+def build_main_reply_keyboard():
+    keyboard = [[KeyboardButton(label) for label in row] for row in MENU_BUTTON_ROWS]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+
+MENU_BUTTON_ACTIONS = {
+    "📊 সারাংশ": summary_command,
+    "💰 ডিপোজিট": deposit_command,
+    "💸 খরচ": addexpense_command,
+    "🍽️ মিল এন্ট্রি": mill_entry_command,
+    "🌅 মিল প্রিসেট": meal_setting_command,
+    "📄 রিপোর্ট": report_command,
+    "📋 হিস্টোরি": history_command,
+    "⚙️ এডমিন": admin_command,
+    "📂 আমার মেস": myaccounts_command,
+    "🆕 নতুন মেস": new_mess,
+    "🔁 রিনিউ": renew_mess_command,
+    "📖 গাইড": guide_command,
+}
 
 def main():
     init_db()
