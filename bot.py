@@ -177,6 +177,18 @@ def init_db():
         dinner REAL NOT NULL DEFAULT 1,
         PRIMARY KEY (mess_id, username)
     )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS debt_entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mess_id INTEGER NOT NULL,
+        person_name TEXT NOT NULL,
+        entry_date TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        amount REAL NOT NULL,
+        note TEXT,
+        created_by INTEGER,
+        created_at TEXT
+    )''')
     conn.commit()
     
     # পুরনো মেস (creator_user_id/type_ordinal ছাড়া) একবারই ব্যাকফিল করা হয়
@@ -278,8 +290,8 @@ def get_next_type_ordinal(creator_user_id, mess_type):
     conn.close()
     return count + 1
 
-MESS_TYPE_SHORT = {'simple': 'Normal', 'student': 'Student', 'personal': 'Personal'}
-MESS_TYPE_SORT_ORDER = {'simple': 0, 'student': 1, 'personal': 2}
+MESS_TYPE_SHORT = {'simple': 'Normal', 'student': 'Student', 'personal': 'Personal', 'debt': 'ধার-দেনা'}
+MESS_TYPE_SORT_ORDER = {'simple': 0, 'student': 1, 'personal': 2, 'debt': 3}
 
 def mess_display_label(mess_info):
     """ইউজারকে দেখানোর জন্য - যেমন 'Student মেস #1' - যাতে প্রতিটা ইউজার নিজের মতো ১ থেকে শুরু করা মেস নম্বর দেখে"""
@@ -387,6 +399,94 @@ def link_user_id(username, user_id):
     c.execute("UPDATE users SET user_id = ? WHERE username = ? AND user_id IS NULL", (user_id, username))
     conn.commit()
     conn.close()
+
+def add_debt_entry(mess_id, person_name, direction, amount, note=None, created_by=None, entry_date=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""INSERT INTO debt_entries (mess_id, person_name, entry_date, direction, amount, note, created_by, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+              (mess_id, person_name, entry_date or datetime.now().strftime("%Y-%m-%d"), direction, amount, note, created_by,
+               datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    entry_id = c.lastrowid
+    conn.close()
+    return entry_id
+
+def get_debt_persons(mess_id):
+    """এই মেসের সব ব্যক্তি, তাদের নেট ব্যালেন্স সহ (০ ব্যালেন্সও দেখানো হয়, ডিলিটের অপশনের জন্য)"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT person_name,
+                 SUM(CASE WHEN direction = 'increase' THEN amount ELSE -amount END) AS balance
+                 FROM debt_entries WHERE mess_id = ?
+                 GROUP BY person_name ORDER BY person_name COLLATE NOCASE""", (mess_id,))
+    rows = c.fetchall()
+    conn.close()
+    return [{'name': name, 'balance': balance or 0.0} for name, balance in rows]
+
+def get_debt_balance(mess_id, person_name):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT SUM(CASE WHEN direction = 'increase' THEN amount ELSE -amount END)
+                 FROM debt_entries WHERE mess_id = ? AND person_name = ?""", (mess_id, person_name))
+    row = c.fetchone()
+    conn.close()
+    return (row[0] or 0.0) if row else 0.0
+
+def get_debt_entries(mess_id, person_name):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT id, entry_date, direction, amount, note FROM debt_entries
+                 WHERE mess_id = ? AND person_name = ? ORDER BY entry_date, id""", (mess_id, person_name))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_debt_entry(entry_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, mess_id, person_name, entry_date, direction, amount, note FROM debt_entries WHERE id = ?", (entry_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    keys = ['id', 'mess_id', 'person_name', 'entry_date', 'direction', 'amount', 'note']
+    return dict(zip(keys, row))
+
+def update_debt_entry(entry_id, direction=None, amount=None, note=None, entry_date=None):
+    entry = get_debt_entry(entry_id)
+    if not entry:
+        return False
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""UPDATE debt_entries SET direction = ?, amount = ?, note = ?, entry_date = ? WHERE id = ?""",
+              (direction if direction is not None else entry['direction'],
+               amount if amount is not None else entry['amount'],
+               note if note is not None else entry['note'],
+               entry_date if entry_date is not None else entry['entry_date'],
+               entry_id))
+    conn.commit()
+    conn.close()
+    return True
+
+def delete_debt_entry(entry_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM debt_entries WHERE id = ?", (entry_id,))
+    conn.commit()
+    conn.close()
+
+def delete_debt_person(mess_id, person_name):
+    """শুধু ব্যালেন্স একদম ০ হলেই ডিলিট করে, নাহলে False রিটার্ন করে"""
+    balance = get_debt_balance(mess_id, person_name)
+    if round(balance, 2) != 0:
+        return False
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM debt_entries WHERE mess_id = ? AND person_name = ?", (mess_id, person_name))
+    conn.commit()
+    conn.close()
+    return True
 
 def remove_user(username, mess_id):
     conn = sqlite3.connect(DB_PATH)
@@ -1104,6 +1204,119 @@ def generate_pdf_report(mess_id):
     buffer.seek(0)
     return buffer
 
+def generate_debt_pdf_report(mess_id):
+    mess_info = get_mess_info(mess_id)
+    persons = get_debt_persons(mess_id)
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=50, leftMargin=50, topMargin=50, bottomMargin=50)
+    story = []
+
+    story.append(bn_text("ধার-দেনার হিসাব রিপোর্ট", size=20, bold=True, color=(26, 42, 108)))
+    story.append(Spacer(1, 14))
+    story.append(bn_text(f"মেস নম্বর: {mess_display_label(mess_info)}", size=12))
+    story.append(Spacer(1, 4))
+    story.append(bn_text(f"জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M')}", size=12))
+    story.append(Spacer(1, 20))
+
+    story.append(bn_text("ব্যক্তি ভিত্তিক ব্যালেন্স", size=13, bold=True))
+    story.append(Spacer(1, 10))
+
+    person_data = [[bn_text("নাম", size=11, bold=True, color=(255, 255, 255)),
+                    bn_text("ব্যালেন্স (টাকা)", size=11, bold=True, color=(255, 255, 255)),
+                    bn_text("অবস্থা", size=11, bold=True, color=(255, 255, 255))]]
+    total_receivable = 0
+    total_payable = 0
+    for p in persons:
+        bal = p['balance']
+        if bal > 0:
+            total_receivable += bal
+            status_text = bn_text("পাবো", size=10, color=(30, 100, 40))
+        elif bal < 0:
+            total_payable += -bal
+            status_text = bn_text("দেনা", size=10, color=(150, 30, 30))
+        else:
+            status_text = bn_text("সমান", size=10, color=(80, 80, 80))
+        person_data.append([bn_text(p['name'], size=10), f"{abs(bal):.2f}", status_text])
+    if not persons:
+        person_data.append([bn_text("(কোনো এন্ট্রি নেই)", size=10), "", ""])
+
+    person_table = Table(person_data, colWidths=[2.3*inch, 1.5*inch, 1.2*inch])
+    person_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a5276')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#eaf2f8')),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor('#f7f9fa'), colors.HexColor('#eaf2f8')])
+    ]))
+    story.append(person_table)
+    story.append(Spacer(1, 20))
+
+    story.append(bn_text("সারাংশ", size=13, bold=True))
+    story.append(Spacer(1, 10))
+    summary_data = [
+        [bn_text("বিবরণ", size=11, bold=True, color=(255, 255, 255)),
+         bn_text("পরিমাণ (টাকা)", size=11, bold=True, color=(255, 255, 255))],
+        [bn_text("মোট পাবো", size=11), f"{total_receivable:.2f}"],
+        [bn_text("মোট দেনা", size=11), f"{total_payable:.2f}"],
+    ]
+    summary_table = Table(summary_data, colWidths=[2.5*inch, 2*inch])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e8449')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('FONTSIZE', (0, 0), (-1, -1), 11),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#e8f8f5')),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 20))
+
+    # বিস্তারিত এন্ট্রি হিস্টোরি (প্রতি ব্যক্তির জন্য)
+    if persons:
+        story.append(bn_text("বিস্তারিত এন্ট্রি", size=13, bold=True))
+        story.append(Spacer(1, 10))
+        entry_data = [[bn_text("তারিখ", size=9, bold=True, color=(255, 255, 255)),
+                       bn_text("নাম", size=9, bold=True, color=(255, 255, 255)),
+                       bn_text("ধরন", size=9, bold=True, color=(255, 255, 255)),
+                       bn_text("পরিমাণ", size=9, bold=True, color=(255, 255, 255)),
+                       bn_text("নোট", size=9, bold=True, color=(255, 255, 255))]]
+        for p in persons:
+            for entry_id, entry_date, direction, amount, note in get_debt_entries(mess_id, p['name']):
+                dir_text = bn_text("বাড়লো" if direction == 'increase' else "ফেরত", size=8)
+                entry_data.append([entry_date, bn_text(p['name'], size=8), dir_text, f"{amount:.2f}", bn_text(note or '', size=8)])
+        entry_table = Table(entry_data, colWidths=[0.9*inch, 1.1*inch, 0.8*inch, 0.9*inch, 1.3*inch])
+        entry_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#a04000')),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#fdf2e9')),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor('#fef9f4'), colors.HexColor('#fdf2e9')])
+        ]))
+        story.append(entry_table)
+        story.append(Spacer(1, 20))
+
+    story.append(Spacer(1, 10))
+    story.append(bn_text(f"জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", size=9, color=(128, 128, 128)))
+    story.append(Spacer(1, 3))
+    story.append(bn_text("© @mess_accounting_bot", size=9, color=(128, 128, 128)))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
 # ============ টেলিগ্রাম হ্যান্ডলার ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1203,6 +1416,8 @@ async def finalize_new_mess(reply_target, context, tg_user, start_date, via_edit
         extra_hint = "\n\n📌 প্রতিদিন মিল এন্ট্রি দিতে /mill_entry কমান্ড ব্যবহার করুন।"
     elif mess_type == 'personal':
         closing_line = "এখনই /addexpense বা /deposit দিয়ে নিজের হিসাব লেখা শুরু করুন — আলাদা ইউজার যোগ করার দরকার নেই।"
+    elif mess_type == 'debt':
+        closing_line = "এখনই /debt_add দিয়ে কার কাছ থেকে কত টাকা পাবেন/কাকে দিতে হবে তার হিসাব লেখা শুরু করুন — আলাদা ইউজার যোগ করার দরকার নেই।"
     confirm_text = (
         f"✅ নতুন মেস শুরু হয়েছে!\n\n"
         f"🆔 মেস: {label}\n"
@@ -1288,21 +1503,24 @@ async def renew_mess_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 MESS_TYPE_LABELS = {
     'simple': '🍽️ সাধারণ মেস (মাথাপিছু হিসাব)',
     'student': '🎓 স্টুডেন্ট মেস (মিল হিসাব)',
-    'personal': '👤 ব্যক্তিগত হিসাব'
+    'personal': '👤 ব্যক্তিগত হিসাব',
+    'debt': '💸 ধার-দেনার হিসাব'
 }
 
 async def new_mess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton(MESS_TYPE_LABELS['simple'], callback_data='newmess_type_simple')],
         [InlineKeyboardButton(MESS_TYPE_LABELS['student'], callback_data='newmess_type_student')],
-        [InlineKeyboardButton(MESS_TYPE_LABELS['personal'], callback_data='newmess_type_personal')]
+        [InlineKeyboardButton(MESS_TYPE_LABELS['personal'], callback_data='newmess_type_personal')],
+        [InlineKeyboardButton(MESS_TYPE_LABELS['debt'], callback_data='newmess_type_debt')]
     ]
     text = (
         "🆕 **নতুন মেস**\n\n"
         "কী ধরনের হিসাব রাখতে চান?\n\n"
         "🍽️ সাধারণ মেস — খরচ সবার মধ্যে মাথাপিছু ভাগ হবে\n"
         "🎓 স্টুডেন্ট মেস — প্রতিদিন কে কয়টা মিল খেলো তার হিসাবে খরচ ভাগ হবে\n"
-        "👤 ব্যক্তিগত হিসাব — শুধু নিজের আয়-ব্যয় ট্র্যাক করার জন্য"
+        "👤 ব্যক্তিগত হিসাব — শুধু নিজের আয়-ব্যয় ট্র্যাক করার জন্য\n"
+        "💸 ধার-দেনার হিসাব — কার কাছ থেকে কত টাকা পাবেন/কাকে দিতে হবে তার হিসাব রাখার জন্য"
     )
     query = update.callback_query
     if query:
@@ -1321,8 +1539,8 @@ async def show_main_menu(message, mess_id, user_id=None):
     status = "✅ সম্পন্ন" if is_completed else "🟢 চলমান"
     mess_type = mess_info.get('mess_type', 'simple')
     type_label = MESS_TYPE_LABELS.get(mess_type, mess_type)
-    
-    await message.reply_text(
+
+    info_lines = (
         f"📆 **মেস ইনফো**\n"
         f"🆔 মেস: {mess_display_label(mess_info)}\n"
         f"🏷️ ধরন: {type_label}\n"
@@ -1330,11 +1548,33 @@ async def show_main_menu(message, mess_id, user_id=None):
         f"📅 শেষ: {mess_info['end_date']}\n"
         f"📌 মাস: {mess_info['month_name']}\n"
         f"📊 স্ট্যাটাস: {status}\n"
-        f"💰 ব্যালেন্স: {get_balance(mess_id):.2f} টাকা\n\n"
-        f"👇 নিচের মেনু থেকে বেছে নিন।",
-        parse_mode='Markdown',
-        reply_markup=build_main_reply_keyboard()
     )
+    if mess_type == 'debt':
+        persons = get_debt_persons(mess_id)
+        receivable = sum(p['balance'] for p in persons if p['balance'] > 0)
+        payable = -sum(p['balance'] for p in persons if p['balance'] < 0)
+        info_lines += (
+            f"📈 মোট পাবো: {receivable:.2f} টাকা\n"
+            f"📉 মোট দেনা: {payable:.2f} টাকা\n\n"
+            f"👇 নিচের মেনু থেকে বেছে নিন।"
+        )
+    else:
+        info_lines += (
+            f"💰 ব্যালেন্স: {get_balance(mess_id):.2f} টাকা\n\n"
+            f"👇 নিচের মেনু থেকে বেছে নিন।"
+        )
+
+    await message.reply_text(
+        info_lines,
+        parse_mode='Markdown',
+        reply_markup=build_main_reply_keyboard(mess_type)
+    )
+    if mess_type == 'debt' and not is_completed:
+        keyboard = [
+            [InlineKeyboardButton("➕ নতুন এন্ট্রি", callback_data=f'debt_add|{mess_id}')],
+            [InlineKeyboardButton("📋 সব হিসাব দেখুন", callback_data=f'debt_list|{mess_id}')]
+        ]
+        await message.reply_text("💸 **ধার-দেনার হিসাব**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1534,6 +1774,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if get_mess_info(mess_id).get('mess_type') == 'personal':
             await query.edit_message_text("❌ এটি একটি ব্যক্তিগত (Personal) হিসাব — এখানে আলাদা ইউজার যোগ করার দরকার নেই।")
+            return
+        if get_mess_info(mess_id).get('mess_type') == 'debt':
+            await query.edit_message_text("❌ এই মেসে নতুন সদস্য যুক্ত করার প্রয়োজন নেই — বরং /debt_add দিয়ে নাম লিখে/বেছে নিয়ে ধার-দেনার হিসাব যুক্ত করুন।")
             return
         context.user_data['action'] = f'add_user_{mess_id}'
         await query.edit_message_text("👤 **ইউজার যোগ করুন**\n\n@username লিখুন (যেমন: @rahim):")
@@ -1760,7 +2003,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text("⏳ **PDF রিপোর্ট তৈরি হচ্ছে...** দয়া করে অপেক্ষা করুন।")
         try:
-            pdf_buffer = generate_pdf_report(mess_id)
+            mess_type_pdf = get_mess_info(mess_id).get('mess_type', 'simple')
+            pdf_buffer = generate_debt_pdf_report(mess_id) if mess_type_pdf == 'debt' else generate_pdf_report(mess_id)
             await query.message.reply_document(
                 document=pdf_buffer,
                 filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
@@ -1769,7 +2013,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.delete_message()
         except Exception as e:
             await query.edit_message_text(f"❌ PDF তৈরি করতে সমস্যা হয়েছে: {str(e)}")
-    
+
     elif data.startswith('pdf_report_'):
         mess_id = int(data.replace('pdf_report_', ''))
         if not is_member_or_admin(user_id, mess_id):
@@ -1777,7 +2021,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text("⏳ **PDF রিপোর্ট তৈরি হচ্ছে...** দয়া করে অপেক্ষা করুন।")
         try:
-            pdf_buffer = generate_pdf_report(mess_id)
+            mess_type_pdf = get_mess_info(mess_id).get('mess_type', 'simple')
+            pdf_buffer = generate_debt_pdf_report(mess_id) if mess_type_pdf == 'debt' else generate_pdf_report(mess_id)
             await query.message.reply_document(
                 document=pdf_buffer,
                 filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
@@ -1798,6 +2043,162 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('back_main_'):
         mess_id = int(data.replace('back_main_', ''))
         await show_main_menu(query.message, mess_id, user_id)
+
+    elif data.startswith('debt_add|'):
+        mess_id = int(data.split('|', 1)[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিনই এন্ট্রি যুক্ত করতে পারবেন!", show_alert=True)
+            return
+        await _debt_show_person_picker(query, context, mess_id, edit=True)
+
+    elif data.startswith('debt_newname|'):
+        mess_id = int(data.split('|', 1)[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিনই এন্ট্রি যুক্ত করতে পারবেন!", show_alert=True)
+            return
+        context.user_data['debt_mess_id'] = mess_id
+        context.user_data['action'] = f'debt_newname|{mess_id}'
+        await query.edit_message_text("✍️ **নাম লিখুন:**", parse_mode='Markdown')
+
+    elif data.startswith('debt_pick|'):
+        _, mess_id_s, person_name = data.split('|', 2)
+        mess_id = int(mess_id_s)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিনই এন্ট্রি যুক্ত করতে পারবেন!", show_alert=True)
+            return
+        await _debt_ask_direction(query, context, mess_id, person_name, edit=True)
+
+    elif data.startswith('debt_dir|'):
+        _, mess_id_s, direction = data.split('|', 2)
+        mess_id = int(mess_id_s)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিনই এন্ট্রি যুক্ত করতে পারবেন!", show_alert=True)
+            return
+        context.user_data['debt_direction'] = direction
+        context.user_data['action'] = f'debt_amount|{mess_id}'
+        await query.edit_message_text(
+            f"💵 **{context.user_data.get('debt_person')}** এর পরিমাণ লিখুন (শুধু সংখ্যা):",
+            parse_mode='Markdown'
+        )
+
+    elif data.startswith('debt_list|'):
+        mess_id = int(data.split('|', 1)[1])
+        if not is_member_or_admin(user_id, mess_id):
+            await query.answer("❌ আপনি এই মেসের সদস্য নন!", show_alert=True)
+            return
+        await _debt_show_list(query, context, mess_id, edit=True)
+
+    elif data.startswith('debt_view|'):
+        _, mess_id_s, person_name = data.split('|', 2)
+        mess_id = int(mess_id_s)
+        if not is_member_or_admin(user_id, mess_id):
+            await query.answer("❌ আপনি এই মেসের সদস্য নন!", show_alert=True)
+            return
+        await _debt_show_person_detail(query, context, mess_id, person_name, edit=True)
+
+    elif data.startswith('debt_editentry|'):
+        entry_id = int(data.split('|', 1)[1])
+        entry = get_debt_entry(entry_id)
+        if not entry or not is_admin(user_id, entry['mess_id']):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        keyboard = [
+            [InlineKeyboardButton("💵 পরিমাণ পরিবর্তন", callback_data=f'debt_edit_amt|{entry_id}')],
+            [InlineKeyboardButton("🔁 ধরন পরিবর্তন (বাড়লো ⇄ ফেরত)", callback_data=f'debt_edit_dir|{entry_id}')],
+            [InlineKeyboardButton("📝 নোট পরিবর্তন", callback_data=f'debt_edit_note|{entry_id}')],
+            [InlineKeyboardButton("🔙 ব্যাক", callback_data=f"debt_view|{entry['mess_id']}|{entry['person_name']}")]
+        ]
+        await query.edit_message_text(
+            f"✏️ **#{entry_id} এন্ট্রি এডিট**\n\n{entry['entry_date']} — {entry['amount']:.2f} টাকা"
+            + (f" ({entry['note']})" if entry['note'] else ""),
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+        )
+
+    elif data.startswith('debt_edit_amt|'):
+        entry_id = int(data.split('|', 1)[1])
+        entry = get_debt_entry(entry_id)
+        if not entry or not is_admin(user_id, entry['mess_id']):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        context.user_data['action'] = f'debt_editamount|{entry_id}'
+        await query.edit_message_text("💵 নতুন পরিমাণ লিখুন:")
+
+    elif data.startswith('debt_edit_dir|'):
+        entry_id = int(data.split('|', 1)[1])
+        entry = get_debt_entry(entry_id)
+        if not entry or not is_admin(user_id, entry['mess_id']):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        new_dir = 'decrease' if entry['direction'] == 'increase' else 'increase'
+        update_debt_entry(entry_id, direction=new_dir)
+        await query.answer("✅ ধরন পরিবর্তন হয়েছে!")
+        await _debt_show_person_detail(query, context, entry['mess_id'], entry['person_name'], edit=True)
+
+    elif data.startswith('debt_edit_note|'):
+        entry_id = int(data.split('|', 1)[1])
+        entry = get_debt_entry(entry_id)
+        if not entry or not is_admin(user_id, entry['mess_id']):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        context.user_data['action'] = f'debt_editnote|{entry_id}'
+        await query.edit_message_text("📝 নতুন নোট লিখুন (না রাখতে চাইলে 'স্কিপ' লিখুন):")
+
+    elif data.startswith('debt_delentry_confirm|'):
+        entry_id = int(data.split('|', 1)[1])
+        entry = get_debt_entry(entry_id)
+        if not entry or not is_admin(user_id, entry['mess_id']):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        delete_debt_entry(entry_id)
+        await query.answer("✅ এন্ট্রি ডিলিট হয়েছে!")
+        await _debt_show_person_detail(query, context, entry['mess_id'], entry['person_name'], edit=True)
+
+    elif data.startswith('debt_delentry|'):
+        entry_id = int(data.split('|', 1)[1])
+        entry = get_debt_entry(entry_id)
+        if not entry or not is_admin(user_id, entry['mess_id']):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        keyboard = [
+            [InlineKeyboardButton("✅ হ্যাঁ, ডিলিট করুন", callback_data=f'debt_delentry_confirm|{entry_id}')],
+            [InlineKeyboardButton("❌ না", callback_data=f"debt_view|{entry['mess_id']}|{entry['person_name']}")]
+        ]
+        await query.edit_message_text(
+            f"⚠️ **#{entry_id} এন্ট্রি ({entry['amount']:.2f} টাকা) ডিলিট করতে চান?**",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+        )
+
+    elif data.startswith('debt_delperson_confirm|'):
+        _, mess_id_s, person_name = data.split('|', 2)
+        mess_id = int(mess_id_s)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        if delete_debt_person(mess_id, person_name):
+            await query.answer("✅ ডিলিট হয়েছে!")
+            await _debt_show_list(query, context, mess_id, edit=True)
+        else:
+            await query.answer("❌ ব্যালেন্স ০ না হলে ডিলিট করা যাবে না!", show_alert=True)
+            await _debt_show_person_detail(query, context, mess_id, person_name, edit=True)
+
+    elif data.startswith('debt_delperson|'):
+        _, mess_id_s, person_name = data.split('|', 2)
+        mess_id = int(mess_id_s)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ অনুমতি নেই!", show_alert=True)
+            return
+        balance = get_debt_balance(mess_id, person_name)
+        if round(balance, 2) != 0:
+            await query.answer("❌ ব্যালেন্স ০ না হলে ডিলিট করা যাবে না!", show_alert=True)
+            return
+        keyboard = [
+            [InlineKeyboardButton("✅ হ্যাঁ, ডিলিট করুন", callback_data=f'debt_delperson_confirm|{mess_id}|{person_name}')],
+            [InlineKeyboardButton("❌ না", callback_data=f'debt_view|{mess_id}|{person_name}')]
+        ]
+        await query.edit_message_text(
+            f"⚠️ **{person_name}** কে ডিলিট করতে চান? (ব্যালেন্স ০)",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+        )
 
 def build_summary_text(mess_id):
     users = get_users(mess_id)
@@ -2077,6 +2478,84 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ ভুল ফরম্যাট! তারিখটি YYYY-MM-DD ফরম্যাটে দিন (যেমন: 2026-01-15)।")
 
+    elif action.startswith('debt_newname|'):
+        mess_id = int(action.split('|', 1)[1])
+        if not is_admin(update.effective_user.id, mess_id):
+            context.user_data['action'] = None
+            return
+        person_name = text.strip()
+        if not person_name:
+            await update.message.reply_text("❌ একটা নাম লিখুন।")
+            return
+        context.user_data['action'] = None
+        await _debt_ask_direction(update.message, context, mess_id, person_name, edit=False)
+
+    elif action.startswith('debt_amount|'):
+        mess_id = int(action.split('|', 1)[1])
+        if not is_admin(update.effective_user.id, mess_id):
+            context.user_data['action'] = None
+            return
+        try:
+            amount = float(text.strip())
+            if amount <= 0:
+                raise ValueError
+            context.user_data['debt_amount'] = amount
+            context.user_data['action'] = f'debt_note|{mess_id}'
+            await update.message.reply_text("📝 নোট লিখতে চাইলে লিখুন, নাহলে 'স্কিপ' লিখুন:")
+        except ValueError:
+            await update.message.reply_text("❌ দয়া করে ০ এর বেশি একটি সংখ্যা দিন!")
+
+    elif action.startswith('debt_note|'):
+        mess_id = int(action.split('|', 1)[1])
+        if not is_admin(update.effective_user.id, mess_id):
+            context.user_data['action'] = None
+            return
+        note = text.strip()
+        if note.lower() in ('স্কিপ', 'skip', '-'):
+            note = None
+        person_name = context.user_data.get('debt_person')
+        direction = context.user_data.get('debt_direction')
+        amount = context.user_data.get('debt_amount')
+        add_debt_entry(mess_id, person_name, direction, amount, note=note, created_by=update.effective_user.id)
+        context.user_data['action'] = None
+        balance = get_debt_balance(mess_id, person_name)
+        await update.message.reply_text(
+            f"✅ **{person_name}** এর এন্ট্রি যুক্ত হয়েছে!\n💰 বর্তমান ব্যালেন্স: {_debt_balance_label(balance)}",
+            parse_mode='Markdown'
+        )
+        await _debt_show_person_detail(update.message, context, mess_id, person_name, edit=False)
+
+    elif action.startswith('debt_editamount|'):
+        entry_id = int(action.split('|', 1)[1])
+        entry = get_debt_entry(entry_id)
+        if not entry or not is_admin(update.effective_user.id, entry['mess_id']):
+            context.user_data['action'] = None
+            return
+        try:
+            amount = float(text.strip())
+            if amount <= 0:
+                raise ValueError
+            update_debt_entry(entry_id, amount=amount)
+            context.user_data['action'] = None
+            await update.message.reply_text("✅ পরিমাণ পরিবর্তন হয়েছে!")
+            await _debt_show_person_detail(update.message, context, entry['mess_id'], entry['person_name'], edit=False)
+        except ValueError:
+            await update.message.reply_text("❌ দয়া করে ০ এর বেশি একটি সংখ্যা দিন!")
+
+    elif action.startswith('debt_editnote|'):
+        entry_id = int(action.split('|', 1)[1])
+        entry = get_debt_entry(entry_id)
+        if not entry or not is_admin(update.effective_user.id, entry['mess_id']):
+            context.user_data['action'] = None
+            return
+        note = text.strip()
+        if note.lower() in ('স্কিপ', 'skip', '-'):
+            note = None
+        update_debt_entry(entry_id, note=note)
+        context.user_data['action'] = None
+        await update.message.reply_text("✅ নোট পরিবর্তন হয়েছে!")
+        await _debt_show_person_detail(update.message, context, entry['mess_id'], entry['person_name'], edit=False)
+
 async def myaccounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     messes = sort_messes_grouped_by_type(get_user_messes(user_id))
@@ -2118,6 +2597,9 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mess_info = get_mess_info(mess_id)
     if mess_info.get('mess_type') == 'personal':
         await update.message.reply_text("❌ এটি একটি ব্যক্তিগত (Personal) হিসাব — এখানে আলাদা ইউজার যোগ করার দরকার নেই, শুধু আপনার নিজের হিসাবই থাকে।")
+        return
+    if mess_info.get('mess_type') == 'debt':
+        await update.message.reply_text("❌ এই মেসে নতুন সদস্য যুক্ত করার প্রয়োজন নেই — বরং /debt_add দিয়ে নাম লিখে/বেছে নিয়ে ধার-দেনার হিসাব যুক্ত করুন।")
         return
     context.user_data['action'] = f'add_user_{mess_id}'
     await update.message.reply_text("👤 **ইউজার যোগ করুন**\n\n@username লিখুন (যেমন: @rahim):")
@@ -2203,7 +2685,8 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _generate_and_send_report(message, mess_id):
     status_msg = await message.reply_text("⏳ **PDF রিপোর্ট তৈরি হচ্ছে...** দয়া করে অপেক্ষা করুন।")
     try:
-        pdf_buffer = generate_pdf_report(mess_id)
+        mess_type = get_mess_info(mess_id).get('mess_type', 'simple')
+        pdf_buffer = generate_debt_pdf_report(mess_id) if mess_type == 'debt' else generate_pdf_report(mess_id)
         await message.reply_document(
             document=pdf_buffer,
             filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
@@ -2212,6 +2695,121 @@ async def _generate_and_send_report(message, mess_id):
         await status_msg.delete()
     except Exception as e:
         await status_msg.edit_text(f"❌ PDF তৈরি করতে সমস্যা হয়েছে: {str(e)}")
+
+# ============ ধার-দেনার হিসাব (debt mess type) ============
+
+def _debt_balance_label(balance):
+    balance = round(balance, 2)
+    if balance > 0:
+        return f"+{balance:.2f} টাকা (পাবো)"
+    elif balance < 0:
+        return f"{balance:.2f} টাকা (দেনা)"
+    return "0.00 টাকা (সমান)"
+
+async def _debt_guard(update: Update, context: ContextTypes.DEFAULT_TYPE, require_not_completed=True):
+    """ধার-দেনা মেস, সক্রিয় মেস, এডমিন - সব গার্ড একসাথে চেক করে, না মিললে মেসেজ দিয়ে None রিটার্ন করে"""
+    mess_id = await _active_mess_or_prompt(update)
+    if not mess_id:
+        return None
+    mess_info = get_mess_info(mess_id)
+    if mess_info.get('mess_type') != 'debt':
+        await update.message.reply_text("❌ এটি ধার-দেনার হিসাবের মেস নয়। /myaccounts দিয়ে সঠিক মেসে যান।")
+        return None
+    user_id = update.effective_user.id
+    if not is_admin(user_id, mess_id):
+        await update.message.reply_text("❌ শুধুমাত্র এই মেসের এডমিনই (যিনি শুরু করেছেন) হিসাব যুক্ত/এডিট করতে পারবেন!")
+        return None
+    if require_not_completed and is_mess_completed(mess_id):
+        await update.message.reply_text("❌ এই মেস সম্পন্ন হয়েছে! নতুন এন্ট্রি যোগ করা যাবে না।")
+        return None
+    return mess_id
+
+async def debt_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mess_id = await _debt_guard(update, context)
+    if not mess_id:
+        return
+    await _debt_show_person_picker(update.message, context, mess_id)
+
+async def debt_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mess_id = await _debt_guard(update, context, require_not_completed=False)
+    if not mess_id:
+        return
+    await _debt_show_list(update.message, context, mess_id)
+
+async def _debt_show_person_picker(reply_target, context, mess_id, edit=False):
+    persons = get_debt_persons(mess_id)
+    keyboard = []
+    for p in persons:
+        keyboard.append([InlineKeyboardButton(
+            f"{p['name']} — {_debt_balance_label(p['balance'])}",
+            callback_data=f"debt_pick|{mess_id}|{p['name']}"
+        )])
+    keyboard.append([InlineKeyboardButton("➕ নতুন নাম লিখবো", callback_data=f'debt_newname|{mess_id}')])
+    text = "👤 **কার নামে এন্ট্রি দিবেন?**\n\nআগের কোনো নাম বেছে নিন, অথবা নতুন নাম লিখুন।"
+    if edit:
+        await reply_target.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await reply_target.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def _debt_show_list(reply_target, context, mess_id, edit=False):
+    persons = get_debt_persons(mess_id)
+    mess_info = get_mess_info(mess_id)
+    if not persons:
+        text = f"📋 **{mess_display_label(mess_info)} — ধার-দেনার হিসাব**\n\nএখনো কোনো এন্ট্রি নেই। /debt_add দিয়ে শুরু করুন।"
+        keyboard = []
+    else:
+        text = f"📋 **{mess_display_label(mess_info)} — ধার-দেনার হিসাব**\n\nবিস্তারিত দেখতে কারো নামে ক্লিক করুন:"
+        keyboard = [[InlineKeyboardButton(
+            f"{p['name']} — {_debt_balance_label(p['balance'])}",
+            callback_data=f"debt_view|{mess_id}|{p['name']}"
+        )] for p in persons]
+    keyboard.append([InlineKeyboardButton("➕ নতুন এন্ট্রি", callback_data=f'debt_add|{mess_id}')])
+    if edit:
+        await reply_target.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await reply_target.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def _debt_ask_direction(reply_target, context, mess_id, person_name, edit=False):
+    context.user_data['debt_person'] = person_name
+    context.user_data['debt_mess_id'] = mess_id
+    keyboard = [
+        [InlineKeyboardButton("🔺 তার থেকে পাওনা বাড়লো (ধার দিলাম)", callback_data=f'debt_dir|{mess_id}|increase')],
+        [InlineKeyboardButton("🔻 সে টাকা ফেরত দিলো (পাওনা কমলো)", callback_data=f'debt_dir|{mess_id}|decrease')]
+    ]
+    text = f"👤 **{person_name}**\n\nএই এন্ট্রিতে কী হয়েছে বেছে নিন:"
+    if edit:
+        await reply_target.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await reply_target.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def _debt_show_person_detail(reply_target, context, mess_id, person_name, edit=False):
+    entries = get_debt_entries(mess_id, person_name)
+    balance = get_debt_balance(mess_id, person_name)
+    text = f"👤 **{person_name}**\n💰 বর্তমান ব্যালেন্স: {_debt_balance_label(balance)}\n\n"
+    if entries:
+        text += "📜 **এন্ট্রি হিস্টোরি:**\n"
+        for entry_id, entry_date, direction, amount, note in entries:
+            dir_label = "🔺 বাড়লো" if direction == 'increase' else "🔻 ফেরত দিলো"
+            text += f"  #{entry_id} — {entry_date} — {dir_label} — {amount:.2f} টাকা"
+            if note:
+                text += f" ({note})"
+            text += "\n"
+    else:
+        text += "(কোনো এন্ট্রি নেই)\n"
+    keyboard = []
+    for entry_id, entry_date, direction, amount, note in entries:
+        keyboard.append([
+            InlineKeyboardButton(f"✏️ #{entry_id} এডিট", callback_data=f'debt_editentry|{entry_id}'),
+            InlineKeyboardButton(f"🗑️ #{entry_id} ডিলিট", callback_data=f'debt_delentry|{entry_id}')
+        ])
+    keyboard.append([InlineKeyboardButton("➕ নতুন এন্ট্রি", callback_data=f'debt_pick|{mess_id}|{person_name}')])
+    if round(balance, 2) == 0:
+        keyboard.append([InlineKeyboardButton("🗑️ এই ব্যক্তিকে ডিলিট করুন", callback_data=f'debt_delperson|{mess_id}|{person_name}')])
+    keyboard.append([InlineKeyboardButton("🔙 সব হিসাব", callback_data=f'debt_list|{mess_id}')])
+    if edit:
+        await reply_target.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await reply_target.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 MILL_QUICK_VALUES = [("নাই", "0"), ("হাফ", "0_5"), ("১", "1"), ("দেড়", "1_5"), ("২", "2")]
 
@@ -2272,10 +2870,11 @@ def build_guide_text():
     return (
         "📖 <b>ব্যবহারবিধি — মেস ম্যানেজমেন্ট বট</b>\n\n"
         "🆕 <b>নতুন মেস শুরু</b>\n"
-        "/new দিয়ে শুরু করুন। ৩ ধরনের মেস আছে:\n"
+        "/new দিয়ে শুরু করুন। ৪ ধরনের মেস আছে:\n"
         "  🍽️ Normal — খরচ সবার মধ্যে মাথাপিছু ভাগ হয়\n"
         "  🎓 Student — প্রতিদিন কে কয়টা মিল খেলো তার হিসাবে খরচ ভাগ হয়\n"
         "  👤 Personal — শুধু নিজের হিসাব রাখার জন্য\n"
+        "  💸 ধার-দেনা — কার কাছ থেকে কত টাকা পাবেন/কাকে দিতে হবে তার হিসাব রাখার জন্য\n"
         "প্রতিটা মেস \"টাইপ মেস #নম্বর\" আকারে দেখা যায় (যেমন Student মেস #1) — নিজের প্রতিটা ধরনের মেস ১ থেকে গোনা হয়।\n\n"
         "🔁 <b>পুরনো মেস থেকে নতুন করে শুরু (একই সদস্য নিয়ে)</b>\n"
         "মেস শেষ (/endmess) করার পর নতুন মাসের জন্য আবার শুরু করতে চাইলে /new দিয়ে নতুন করে সব ইউজার যোগ করতে হবে না — /renew দিয়ে আগের কোন মেস থেকে শুরু করবেন বেছে নিলে সেই মেসের সব সদস্য/এডমিন এমনিই চলে আসবে, শুধু হিসাব (ডিপোজিট/খরচ/মিল) শূন্য থেকে শুরু হবে। শুরুর তারিখ ও মাসের নাম অটোমেটিক আজকের দিন/মাস অনুযায়ী বসবে।\n\n"
@@ -2296,6 +2895,11 @@ def build_guide_text():
         "⚙️ <b>এডমিন</b>\n"
         "/admin — এডমিন প্যানেল (নতুন এডমিন বানানো, সদস্য রিমুভ)\n"
         "/endmess — মেস সম্পন্ন করে ফাইনাল রিপোর্ট তৈরি করুন\n\n"
+        "💸 <b>ধার-দেনার হিসাব</b>\n"
+        "যে কেউ /new দিয়ে এই ধরনের মেস শুরু করতে পারে — আলাদা ইউজার যোগ করার দরকার নেই।\n"
+        "/debt_add দিয়ে কার নামে এন্ট্রি দিবেন তা লিখুন বা আগের কোনো নাম বেছে নিন, তারপর তার থেকে পাওনা বাড়লো (ধার দিলাম) নাকি সে ফেরত দিলো (পাওনা কমলো) সেটা বেছে নিয়ে টাকার পরিমাণ ও (ইচ্ছা করলে) একটা নোট লিখুন।\n"
+        "/debt_list দিয়ে সবার বর্তমান ব্যালেন্স দেখুন — কারো নামে ক্লিক করলে তার সব এন্ট্রির হিস্টোরি, এডিট ও ডিলিট অপশন পাবেন।\n"
+        "কারো হিসাব একদম ০ হয়ে গেলে তার ডিটেইল পেজে \"এই ব্যক্তিকে ডিলিট করুন\" অপশন চলে আসে — তখন চাইলে তার নাম মুছে দেওয়া যায়।\n\n"
         "🔀 একাধিক মেসের সাথে যুক্ত থাকলে /start দিয়ে যেকোনো একটায় সুইচ করা যায়।"
     )
 
@@ -2464,6 +3068,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌅 /meal_setting — নিজের সকাল/দুপুর/রাতের মিল প্রিসেট সেট করুন (স্টুডেন্ট মেস)\n"
         "⚙️ /admin — এডমিন ম্যানেজমেন্ট (এডমিন)\n"
         "🔚 /endmess — মেস শেষ করুন (এডমিন)\n"
+        "💸 /debt_add — ধার-দেনার নতুন এন্ট্রি যোগ করুন (ধার-দেনা মেস)\n"
+        "📋 /debt_list — ধার-দেনার সব ব্যক্তির হিসাব দেখুন (ধার-দেনা মেস)\n"
         "📖 /guide — বিস্তারিত ব্যবহারবিধি\n"
         "❓ /help — এই সাহায্য বার্তা\n\n"
         "প্রতিটা মেসের নিজস্ব এডমিন থাকে। যে মেস শুরু করে সে-ই সেই মেসের এডমিন।",
@@ -2488,6 +3094,8 @@ async def post_init(application: Application):
         BotCommand("myaccounts", "📂 আমার মেসসমূহ"),
         BotCommand("new", "🆕 নতুন মেস শুরু করুন"),
         BotCommand("renew", "🔁 আগের মেস থেকে (একই সদস্য) নতুন শুরু"),
+        BotCommand("debt_add", "💸 ধার-দেনার এন্ট্রি যোগ করুন"),
+        BotCommand("debt_list", "📋 ধার-দেনার হিসাব দেখুন"),
         BotCommand("help", "❓ সাহায্য"),
         BotCommand("guide", "📖 ব্যবহারবিধি")
     ])
@@ -2499,9 +3107,22 @@ MENU_BUTTON_ROWS = [
     ["🆕 নতুন মেস", "🔁 রিনিউ", "📖 গাইড"],
 ]
 
-def build_main_reply_keyboard():
-    keyboard = [[KeyboardButton(label) for label in row] for row in MENU_BUTTON_ROWS]
+DEBT_MENU_BUTTON_ROWS = [
+    ["🧾 নতুন এন্ট্রি", "📋 সব হিসাব"],
+    ["⚙️ এডমিন", "📂 আমার মেস"],
+    ["🆕 নতুন মেস", "🔁 রিনিউ", "📖 গাইড"],
+]
+
+def build_main_reply_keyboard(mess_type=None):
+    rows = DEBT_MENU_BUTTON_ROWS if mess_type == 'debt' else MENU_BUTTON_ROWS
+    keyboard = [[KeyboardButton(label) for label in row] for row in rows]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+
+async def debt_add_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debt_add_command(update, context)
+
+async def debt_list_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debt_list_command(update, context)
 
 MENU_BUTTON_ACTIONS = {
     "📊 সারাংশ": summary_command,
@@ -2516,6 +3137,8 @@ MENU_BUTTON_ACTIONS = {
     "🆕 নতুন মেস": new_mess,
     "🔁 রিনিউ": renew_mess_command,
     "📖 গাইড": guide_command,
+    "🧾 নতুন এন্ট্রি": debt_add_menu_button,
+    "📋 সব হিসাব": debt_list_menu_button,
 }
 
 def main():
@@ -2538,6 +3161,8 @@ def main():
     app.add_handler(CommandHandler("endmess", endmess_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("guide", guide_command))
+    app.add_handler(CommandHandler("debt_add", debt_add_command))
+    app.add_handler(CommandHandler("debt_list", debt_list_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
