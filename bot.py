@@ -2,6 +2,14 @@ import os
 import sqlite3
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
+
+# সার্ভার যে টাইমজোনেই চলুক (বেশিরভাগ ক্লাউড/ডকারে UTC), বট সবসময় বাংলাদেশ সময় (BDT, UTC+6)
+# অনুযায়ী "আজকের তারিখ"/টাইমস্ট্যাম্প হিসাব করে — নাহলে রাত ১২টা থেকে ভোর ৬টার মধ্যে
+# (UTC তে তখনো আগের দিন) এন্ট্রি/রিপোর্ট ভুল তারিখে চলে যেতো
+BD_TZ = ZoneInfo("Asia/Dhaka")
+
+def bd_now():
+    return datetime.now(BD_TZ)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from reportlab.lib.pagesizes import A4
@@ -383,7 +391,7 @@ def add_user(username, mess_id, full_name=None, user_id=None):
     c = conn.cursor()
     try:
         c.execute("INSERT INTO users (username, full_name, mess_id, added_date, user_id) VALUES (?, ?, ?, ?, ?)", 
-                 (username, full_name or username, mess_id, datetime.now().strftime("%Y-%m-%d %H:%M"), user_id))
+                 (username, full_name or username, mess_id, bd_now().strftime("%Y-%m-%d %H:%M"), user_id))
         conn.commit()
         return True
     except:
@@ -405,8 +413,8 @@ def add_debt_entry(mess_id, person_name, direction, amount, note=None, created_b
     c = conn.cursor()
     c.execute("""INSERT INTO debt_entries (mess_id, person_name, entry_date, direction, amount, note, created_by, created_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-              (mess_id, person_name, entry_date or datetime.now().strftime("%Y-%m-%d"), direction, amount, note, created_by,
-               datetime.now().strftime("%Y-%m-%d %H:%M")))
+              (mess_id, person_name, entry_date or bd_now().strftime("%Y-%m-%d"), direction, amount, note, created_by,
+               bd_now().strftime("%Y-%m-%d %H:%M")))
     conn.commit()
     entry_id = c.lastrowid
     conn.close()
@@ -517,7 +525,7 @@ def add_admin(user_id, mess_id, username=None):
     c = conn.cursor()
     try:
         c.execute("INSERT OR REPLACE INTO admins (user_id, mess_id, username, added_date) VALUES (?, ?, ?, ?)",
-                  (user_id, mess_id, username, datetime.now().strftime("%Y-%m-%d %H:%M")))
+                  (user_id, mess_id, username, bd_now().strftime("%Y-%m-%d %H:%M")))
         conn.commit()
         return True
     except:
@@ -553,7 +561,7 @@ def is_member_or_admin(user_id, mess_id):
 def add_deposit(username, amount, mess_id, note=""):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    date = bd_now().strftime("%Y-%m-%d %H:%M")
     c.execute("INSERT INTO deposits (username, amount, date, note, mess_id) VALUES (?, ?, ?, ?, ?)", 
              (username, amount, date, note, mess_id))
     conn.commit()
@@ -563,7 +571,7 @@ def add_expense(description, amount, mess_id, added_by="System", date=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if date is None:
-        date = datetime.now().strftime("%Y-%m-%d %H:%M")
+        date = bd_now().strftime("%Y-%m-%d %H:%M")
     c.execute("INSERT INTO expenses (description, amount, date, added_by, mess_id) VALUES (?, ?, ?, ?, ?)", 
              (description, amount, date, added_by, mess_id))
     conn.commit()
@@ -850,7 +858,7 @@ def generate_pdf_report(mess_id):
     mess_type = mess_info.get('mess_type', 'simple')
     
     start_date = mess_info['start_date']
-    end_date = mess_info['end_date'] if mess_info['end_date'] != 'চলমান' else datetime.now().strftime("%Y-%m-%d")
+    end_date = mess_info['end_date'] if mess_info['end_date'] != 'চলমান' else bd_now().strftime("%Y-%m-%d")
     
     # ডিপোজিট/খরচের টাইমস্ট্যাম্প এ সময়ও (HH:MM) থাকে, তাই পুরো দিন কভার করতে
     # কোয়েরির জন্য সীমা প্রশস্ত করা হচ্ছে (নাহলে আজকের এন্ট্রি বাদ পড়ে যায়)
@@ -889,7 +897,7 @@ def generate_pdf_report(mess_id):
     story.append(Spacer(1, 4))
     story.append(bn_text(f"সময়কাল: {start_date} থেকে {end_date}", size=12))
     story.append(Spacer(1, 4))
-    story.append(bn_text(f"জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M')}", size=12))
+    story.append(bn_text(f"জেনারেট: {bd_now().strftime('%Y-%m-%d %H:%M')}", size=12))
     story.append(Spacer(1, 20))
     
     # ইউজার ডিপোজিট টেবিল
@@ -1236,7 +1244,7 @@ def generate_pdf_report(mess_id):
     
     # ফুটার
     story.append(Spacer(1, 30))
-    story.append(bn_text(f"জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", size=9, color=(128, 128, 128)))
+    story.append(bn_text(f"জেনারেট: {bd_now().strftime('%Y-%m-%d %H:%M:%S')}", size=9, color=(128, 128, 128)))
     story.append(Spacer(1, 3))
     story.append(bn_text("© @mess_accounting_bot", size=9, color=(128, 128, 128)))
     
@@ -1257,7 +1265,7 @@ def generate_debt_pdf_report(mess_id):
     story.append(Spacer(1, 14))
     story.append(bn_text(f"মেস নম্বর: {mess_display_label(mess_info)}", size=12))
     story.append(Spacer(1, 4))
-    story.append(bn_text(f"জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M')}", size=12))
+    story.append(bn_text(f"জেনারেট: {bd_now().strftime('%Y-%m-%d %H:%M')}", size=12))
     story.append(Spacer(1, 20))
 
     story.append(bn_text("ব্যক্তি ভিত্তিক ব্যালেন্স", size=13, bold=True))
@@ -1350,7 +1358,7 @@ def generate_debt_pdf_report(mess_id):
         story.append(Spacer(1, 20))
 
     story.append(Spacer(1, 10))
-    story.append(bn_text(f"জেনারেট: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", size=9, color=(128, 128, 128)))
+    story.append(bn_text(f"জেনারেট: {bd_now().strftime('%Y-%m-%d %H:%M:%S')}", size=9, color=(128, 128, 128)))
     story.append(Spacer(1, 3))
     story.append(bn_text("© @mess_accounting_bot", size=9, color=(128, 128, 128)))
 
@@ -1777,7 +1785,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id, mess_id):
             await query.answer("❌ শুধুমাত্র এডমিন মিল এন্ট্রি দিতে পারবেন!", show_alert=True)
             return
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = bd_now().strftime("%Y-%m-%d")
         await start_mill_exception_flow(query, context, mess_id, today, via_edit=True)
     
     elif data.startswith('mill_date_custom|'):
@@ -2121,7 +2129,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pdf_buffer = generate_debt_pdf_report(mess_id) if mess_type_pdf == 'debt' else generate_pdf_report(mess_id)
             await query.message.reply_document(
                 document=pdf_buffer,
-                filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                filename=f"mess_report_{mess_id}_{bd_now().strftime('%Y%m%d')}.pdf",
                 caption=f"📄 {mess_display_label(get_mess_info(mess_id))} এর ফাইনাল রিপোর্ট"
             )
             await query.delete_message()
@@ -2139,7 +2147,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pdf_buffer = generate_debt_pdf_report(mess_id) if mess_type_pdf == 'debt' else generate_pdf_report(mess_id)
             await query.message.reply_document(
                 document=pdf_buffer,
-                filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                filename=f"mess_report_{mess_id}_{bd_now().strftime('%Y%m%d')}.pdf",
                 caption=f"📄 {mess_display_label(get_mess_info(mess_id))} এর ফাইনাল রিপোর্ট"
             )
             await query.delete_message()
@@ -2349,7 +2357,7 @@ def build_summary_text(mess_id):
     
     if mess_type == 'student' and users:
         s_date = mess_info['start_date']
-        e_date = mess_info['end_date'] if mess_info['end_date'] != 'চলমান' else datetime.now().strftime("%Y-%m-%d")
+        e_date = mess_info['end_date'] if mess_info['end_date'] != 'চলমান' else bd_now().strftime("%Y-%m-%d")
         daily_totals = get_daily_mill_totals(mess_id, s_date, e_date)
         if daily_totals:
             text += "\n\n🍽️ **সাম্প্রতিক দিনের মোট মিল:**\n"
@@ -2563,7 +2571,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = float(text)
             context.user_data['expense_amount'] = amount
             context.user_data['action'] = None
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = bd_now().strftime("%Y-%m-%d")
             keyboard = [
                 [InlineKeyboardButton(f"📅 আজকে ({today})", callback_data=f'expense_date_today|{mess_id}')],
                 [InlineKeyboardButton("🗓️ অন্য তারিখ লিখবো", callback_data=f'expense_date_custom|{mess_id}')]
@@ -2809,7 +2817,7 @@ async def _generate_and_send_report(message, mess_id):
         pdf_buffer = generate_debt_pdf_report(mess_id) if mess_type == 'debt' else generate_pdf_report(mess_id)
         await message.reply_document(
             document=pdf_buffer,
-            filename=f"mess_report_{mess_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
+            filename=f"mess_report_{mess_id}_{bd_now().strftime('%Y%m%d')}.pdf",
             caption=f"📄 {mess_display_label(get_mess_info(mess_id))} এর ফাইনাল রিপোর্ট"
         )
         await status_msg.delete()
@@ -2936,8 +2944,6 @@ MILL_QUICK_VALUES = [("নাই", "0"), ("হাফ", "0_5"), ("১", "1"), ("�
 def _mill_val_to_float(v):
     return float(v.replace('_', '.'))
 
-BD_TZ = ZoneInfo("Asia/Dhaka")
-
 async def auto_nightly_digest_job(context: ContextTypes.DEFAULT_TYPE):
     """প্রতিদিন রাত ১১টায় (বাংলাদেশ সময়) চলে - পার্সোনাল ও ধার-দেনা বাদে সব ধরনের মেসের প্রতিটা সদস্যকে
     তাদের /summary ও /history অটোমেটিক পাঠিয়ে দেয়, যাতে সবাই দিন শেষে হিসাবটা দেখে নিতে পারে"""
@@ -3044,7 +3050,7 @@ async def mill_entry_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not get_users(mess_id):
         await update.message.reply_text("❌ কোনো ইউজার নেই! আগে /adduser দিয়ে ইউজার যোগ করুন।")
         return
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = bd_now().strftime("%Y-%m-%d")
     keyboard = [
         [InlineKeyboardButton(f"📅 আজকে ({today})", callback_data=f'mill_date_today|{mess_id}')],
         [InlineKeyboardButton("🗓️ অন্য তারিখ লিখবো", callback_data=f'mill_date_custom|{mess_id}')]
