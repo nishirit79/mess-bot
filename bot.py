@@ -787,6 +787,47 @@ def get_next_mess_id():
     conn.close()
     return (result or 0) + 1
 
+def renumber_type_ordinals(creator_user_id, mess_type):
+    """এই ইউজারের এই ধরনের মেসগুলোকে তৈরির ক্রম অনুযায়ী আবার ১,২,৩... নম্বর দেয়
+    (মাঝখানের কোনোটা ডিলিট হলে পরেরগুলো এগিয়ে আসে, যেমন ২,৩ ডিলিট হলে ৪ নং হয়ে যায় ২ নং)"""
+    if creator_user_id is None:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT key FROM mess_settings WHERE key LIKE 'mess_%_info'
+                 AND creator_user_id = ? AND mess_type = ?
+                 ORDER BY CAST(SUBSTR(key, 6, LENGTH(key)-10) AS INTEGER)""",
+              (creator_user_id, mess_type))
+    keys = [r[0] for r in c.fetchall()]
+    for idx, key in enumerate(keys, start=1):
+        c.execute("UPDATE mess_settings SET type_ordinal = ? WHERE key = ?", (idx, key))
+    conn.commit()
+    conn.close()
+
+def delete_mess(mess_id):
+    """মেস এবং তার সব ডেটা (সদস্য/এডমিন/ডিপোজিট/খরচ/মিল/প্রিসেট/ধার-দেনা) স্থায়ীভাবে মুছে দেয়,
+    তারপর একই ইউজারের একই ধরনের বাকি মেসগুলোর নম্বর আবার ক্রমানুসারে সাজিয়ে দেয়"""
+    info = get_mess_info(mess_id)
+    if not info:
+        return False
+    creator_user_id = info.get('creator_user_id')
+    mess_type = info.get('mess_type', 'simple')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM mess_settings WHERE key = ?", (f'mess_{mess_id}_info',))
+    c.execute("DELETE FROM admins WHERE mess_id = ?", (mess_id,))
+    c.execute("DELETE FROM users WHERE mess_id = ?", (mess_id,))
+    c.execute("DELETE FROM deposits WHERE mess_id = ?", (mess_id,))
+    c.execute("DELETE FROM expenses WHERE mess_id = ?", (mess_id,))
+    c.execute("DELETE FROM mills WHERE mess_id = ?", (mess_id,))
+    c.execute("DELETE FROM meal_presets WHERE mess_id = ?", (mess_id,))
+    c.execute("DELETE FROM debt_entries WHERE mess_id = ?", (mess_id,))
+    c.execute("UPDATE user_state SET current_mess_id = NULL WHERE current_mess_id = ?", (mess_id,))
+    conn.commit()
+    conn.close()
+    renumber_type_ordinals(creator_user_id, mess_type)
+    return True
+
 def is_mess_completed(mess_id):
     info = get_mess_info(mess_id)
     if info and info['end_date'] != 'চলমান':
@@ -1326,29 +1367,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tg_username:
         link_user_id(tg_username, user_id)
 
+    my_messes = sort_messes_grouped_by_type(get_user_messes(user_id))
+    running_messes = [m for m in my_messes if m['end_date'] == 'চলমান']
+
     active_mess_id = get_current_mess_id(user_id)
-    if active_mess_id and get_mess_info(active_mess_id) and is_member_or_admin(user_id, active_mess_id):
+    active_info = get_mess_info(active_mess_id) if active_mess_id else None
+    # বর্তমান সক্রিয় (সেট করা) মেসটা যদি এখনো চলমান থাকে, সেটাই দেখানো হয়
+    if active_info and is_member_or_admin(user_id, active_mess_id) and active_info['end_date'] == 'চলমান':
         await show_main_menu(update.message, active_mess_id, user_id)
         return
 
-    my_messes = sort_messes_grouped_by_type(get_user_messes(user_id))
-
-    if len(my_messes) == 1:
-        set_current_mess_id(user_id, my_messes[0]['id'])
-        await show_main_menu(update.message, my_messes[0]['id'], user_id)
+    # বর্তমান মেস সম্পন্ন হয়ে গেছে (বা কখনো সেট হয়নি) - ইউজারের অন্য কোনো চলমান মেস থাকলে
+    # সেটাতেই নিয়ে যাওয়া হয়, যাতে রিনিউ/আবার শুরু করার পর /start দিলে রানিং মেসটাই দেখা যায়
+    if len(running_messes) == 1:
+        set_current_mess_id(user_id, running_messes[0]['id'])
+        await show_main_menu(update.message, running_messes[0]['id'], user_id)
         return
 
-    if len(my_messes) > 1:
+    if len(running_messes) > 1:
         keyboard = []
-        for mess in my_messes:
-            status = "✅" if mess['end_date'] != 'চলমান' else "🟢"
+        for mess in running_messes:
             keyboard.append([InlineKeyboardButton(
-                f"{status} {mess_display_label(mess)} - {mess['month_name']}",
+                f"🟢 {mess_display_label(mess)} - {mess['month_name']}",
                 callback_data=f'switch_mess_{mess["id"]}'
             )])
         keyboard.append([InlineKeyboardButton("🆕 নতুন মেস শুরু করুন", callback_data='new_mess')])
         await update.message.reply_text(
-            f"🏠 **স্বাগতম, {display_name}!**\n\nআপনি একাধিক মেসের সাথে যুক্ত আছেন। কোনটা দেখতে চান?",
+            f"🏠 **স্বাগতম, {display_name}!**\n\nআপনি একাধিক চলমান মেসের সাথে যুক্ত আছেন। কোনটা দেখতে চান?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return
+
+    if my_messes:
+        # কোনো চলমান মেস নেই, শুধু আগের সম্পন্ন হওয়া মেস আছে
+        keyboard = []
+        for mess in my_messes:
+            keyboard.append([InlineKeyboardButton(
+                f"✅ {mess_display_label(mess)} - {mess['month_name']}",
+                callback_data=f'switch_mess_{mess["id"]}'
+            )])
+        keyboard.append([InlineKeyboardButton("🆕 নতুন মেস শুরু করুন", callback_data='new_mess')])
+        await update.message.reply_text(
+            f"🏠 **স্বাগতম, {display_name}!**\n\nআপনার কোনো চলমান মেস নেই। আগের কোনোটা দেখতে চান, নাকি নতুন শুরু করবেন?",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
@@ -1446,8 +1507,10 @@ async def finalize_renew(reply_target, context, user_id, old_mess_id, start_date
                     creator_user_id=user_id, type_ordinal=type_ordinal, default_breakfast=default_breakfast)
     
     # পুরনো মেসের সব এডমিন কপি
+    copied_user_ids = set()
     for admin_uid, admin_username in get_admins(old_mess_id):
         add_admin(admin_uid, new_mess_id, admin_username)
+        copied_user_ids.add(admin_uid)
     # পুরনো মেসের সব সদস্য কপি (ইউজার আইডি সহ)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -1456,11 +1519,17 @@ async def finalize_renew(reply_target, context, user_id, old_mess_id, start_date
     conn.close()
     for username, full_name, member_user_id in old_users:
         add_user(username, new_mess_id, full_name=full_name, user_id=member_user_id)
+        if member_user_id:
+            copied_user_ids.add(member_user_id)
         if mess_type == 'student':
             p = get_meal_preset(old_mess_id, username)
             set_meal_preset(new_mess_id, username, p['breakfast'], p['lunch'], p['dinner'])
-    
-    set_current_mess_id(user_id, new_mess_id)
+
+    # সব সদস্য/এডমিনের বর্তমান সক্রিয় মেস এই নতুনটায় সেট করে দেওয়া হয়, যাতে তারা
+    # /start দিলে বা বট আবার চালু করলে এই রানিং মেসটাই দেখতে পায়
+    copied_user_ids.add(user_id)
+    for uid in copied_user_ids:
+        set_current_mess_id(uid, new_mess_id)
     label = mess_display_label(get_mess_info(new_mess_id))
     confirm_text = (
         f"✅ নতুন হিসাব শুরু হয়েছে!\n\n"
@@ -1642,7 +1711,52 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_current_mess_id(user_id, mess_id)
         await query.edit_message_text(f"✅ {mess_display_label(get_mess_info(mess_id))} এ স্যুইচ করা হয়েছে!")
         await show_main_menu(query.message, mess_id, user_id)
-    
+
+    elif data.startswith('del_mess_confirm|'):
+        mess_id = int(data.split('|', 1)[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিনই মেস ডিলিট করতে পারবেন!", show_alert=True)
+            return
+        label = mess_display_label(get_mess_info(mess_id))
+        delete_mess(mess_id)
+        await query.edit_message_text(f"🗑️ **{label}** স্থায়ীভাবে ডিলিট হয়ে গেছে।\n\nবাকি মেসগুলোর নম্বর নতুন করে সাজানো হয়েছে।", parse_mode='Markdown')
+
+    elif data.startswith('del_mess|'):
+        mess_id = int(data.split('|', 1)[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিনই মেস ডিলিট করতে পারবেন!", show_alert=True)
+            return
+        label = mess_display_label(get_mess_info(mess_id))
+        keyboard = [
+            [InlineKeyboardButton("✅ হ্যাঁ, স্থায়ীভাবে ডিলিট করুন", callback_data=f'del_mess_confirm|{mess_id}')],
+            [InlineKeyboardButton("❌ না", callback_data='my_accounts_back')]
+        ]
+        await query.edit_message_text(
+            f"⚠️ **{label}** কি স্থায়ীভাবে ডিলিট করতে চান?\n\nএর সব ডিপোজিট/খরচ/মিল/ধার-দেনার হিসাব হারিয়ে যাবে — এটা আর ফিরিয়ে আনা যাবে না!",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+        )
+
+    elif data == 'my_accounts_back':
+        messes = sort_messes_grouped_by_type(get_user_messes(user_id))
+        if not messes:
+            await query.edit_message_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন।")
+            return
+        keyboard = []
+        for mess in messes:
+            status = "✅" if mess['end_date'] != 'চলমান' else "🟢"
+            row = [InlineKeyboardButton(
+                f"{status} {mess_display_label(mess)} - {mess['month_name']}",
+                callback_data=f'switch_mess_{mess["id"]}'
+            )]
+            if is_admin(user_id, mess['id']):
+                row.append(InlineKeyboardButton("🗑️", callback_data=f'del_mess|{mess["id"]}'))
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
+        await query.edit_message_text(
+            "📂 **আপনার মেসসমূহ:**\n\n🗑️ বাটনে ক্লিক করে অপ্রয়োজনীয় মেস স্থায়ীভাবে ডিলিট করতে পারবেন (শুধু এডমিন)।",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+        )
+
     elif data == 'back_start':
         await start(update, context)
     
@@ -2565,12 +2679,18 @@ async def myaccounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     keyboard = []
     for mess in messes:
         status = "✅" if mess['end_date'] != 'চলমান' else "🟢"
-        keyboard.append([InlineKeyboardButton(
+        row = [InlineKeyboardButton(
             f"{status} {mess_display_label(mess)} - {mess['month_name']}",
             callback_data=f'switch_mess_{mess["id"]}'
-        )])
+        )]
+        if is_admin(user_id, mess['id']):
+            row.append(InlineKeyboardButton("🗑️", callback_data=f'del_mess|{mess["id"]}'))
+        keyboard.append(row)
     keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
-    await update.message.reply_text("📂 **আপনার মেসসমূহ:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await update.message.reply_text(
+        "📂 **আপনার মেসসমূহ:**\n\n🗑️ বাটনে ক্লিক করে অপ্রয়োজনীয় মেস স্থায়ীভাবে ডিলিট করতে পারবেন (শুধু এডমিন)।",
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+    )
 
 async def _active_mess_or_prompt(update: Update):
     """বর্তমান সক্রিয় মেস রিটার্ন করে; না থাকলে ইউজারকে জানিয়ে None রিটার্ন করে।"""
@@ -2819,10 +2939,10 @@ def _mill_val_to_float(v):
 BD_TZ = ZoneInfo("Asia/Dhaka")
 
 async def auto_nightly_digest_job(context: ContextTypes.DEFAULT_TYPE):
-    """প্রতিদিন রাত ১১টায় (বাংলাদেশ সময়) চলে - পার্সোনাল বাদে সব ধরনের মেসের প্রতিটা সদস্যকে
+    """প্রতিদিন রাত ১১টায় (বাংলাদেশ সময়) চলে - পার্সোনাল ও ধার-দেনা বাদে সব ধরনের মেসের প্রতিটা সদস্যকে
     তাদের /summary ও /history অটোমেটিক পাঠিয়ে দেয়, যাতে সবাই দিন শেষে হিসাবটা দেখে নিতে পারে"""
     for mess in get_all_messes():
-        if mess.get('mess_type') == 'personal':
+        if mess.get('mess_type') in ('personal', 'debt'):
             continue
         if is_mess_completed(mess['id']):
             continue
@@ -2891,7 +3011,7 @@ def build_guide_text():
         "/summary — এখন পর্যন্তের হিসাব (টেক্সট)\n"
         "/report — ফাইনাল PDF রিপোর্ট (কোন মেসের জন্য চান জিজ্ঞেস করবে — চলমান বা আগের যেকোনো মেস বেছে নেওয়া যায়)\n"
         "/history — সাম্প্রতিক লেনদেন\n"
-        "🌙 Normal ও Student মেসে প্রতি রাত ১১টায় প্রতিটা সদস্যকে নিজে থেকেই /summary ও /history পাঠিয়ে দেয় বট (Personal মেসে এটা হয় না)।\n\n"
+        "🌙 Normal ও Student মেসে প্রতি রাত ১১টায় প্রতিটা সদস্যকে নিজে থেকেই /summary ও /history পাঠিয়ে দেয় বট (Personal ও ধার-দেনা মেসে এটা হয় না)।\n\n"
         "⚙️ <b>এডমিন</b>\n"
         "/admin — এডমিন প্যানেল (নতুন এডমিন বানানো, সদস্য রিমুভ)\n"
         "/endmess — মেস সম্পন্ন করে ফাইনাল রিপোর্ট তৈরি করুন\n\n"
