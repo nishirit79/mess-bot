@@ -859,12 +859,14 @@ def generate_pdf_report(mess_id):
     
     start_date = mess_info['start_date']
     end_date = mess_info['end_date'] if mess_info['end_date'] != 'চলমান' else bd_now().strftime("%Y-%m-%d")
-    
-    # ডিপোজিট/খরচের টাইমস্ট্যাম্প এ সময়ও (HH:MM) থাকে, তাই পুরো দিন কভার করতে
-    # কোয়েরির জন্য সীমা প্রশস্ত করা হচ্ছে (নাহলে আজকের এন্ট্রি বাদ পড়ে যায়)
-    query_start = f"{start_date} 00:00"
-    query_end = f"{end_date} 23:59"
-    
+
+    # মেসের start_date/end_date দিয়ে বাঁধা রেঞ্জ ব্যবহার করা হয় না — কারণ /addexpense বা /deposit এ
+    # ইচ্ছামতো কাস্টম তারিখ (এমনকি start_date-এর আগের তারিখও) দেওয়া যায়। সেই এন্ট্রিগুলো যেন PDF-এ
+    # বাদ না পড়ে (আর তাই লাইভ /summary এর সাথে PDF-এর টাকার হিসাব না মিলে যায়), তাই এখানে পুরো
+    # রেঞ্জ ব্যবহার হচ্ছে — এই মেসের (mess_id) সব ডিপোজিট/খরচ, তারিখ যাই হোক না কেন
+    query_start = "0001-01-01 00:00"
+    query_end = "9999-12-31 23:59"
+
     deposits = get_deposits_with_date(mess_id, query_start, query_end)
     expenses = get_expenses_with_date(mess_id, query_start, query_end)
     
