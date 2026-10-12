@@ -649,8 +649,26 @@ def get_recent_deposits(mess_id, limit=10):
 def get_recent_expenses(mess_id, limit=10):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT description, amount, date, added_by FROM expenses WHERE mess_id = ? ORDER BY date DESC LIMIT ?", 
+    c.execute("SELECT description, amount, date, added_by FROM expenses WHERE mess_id = ? ORDER BY date DESC LIMIT ?",
              (mess_id, limit))
+    data = c.fetchall()
+    conn.close()
+    return data
+
+def get_all_deposits_asc(mess_id):
+    """মেস শুরু থেকে এখন পর্যন্ত সব ডিপোজিট, পুরনো থেকে নতুন (তারিখ অনুযায়ী ক্রমানুসারে)"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username, amount, date, note FROM deposits WHERE mess_id = ? ORDER BY date ASC", (mess_id,))
+    data = c.fetchall()
+    conn.close()
+    return data
+
+def get_all_expenses_asc(mess_id):
+    """মেস শুরু থেকে এখন পর্যন্ত সব খরচ, পুরনো থেকে নতুন (তারিখ অনুযায়ী ক্রমানুসারে)"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT description, amount, date, added_by FROM expenses WHERE mess_id = ? ORDER BY date ASC", (mess_id,))
     data = c.fetchall()
     conn.close()
     return data
@@ -2402,33 +2420,50 @@ async def show_summary(query, mess_id):
     await query.edit_message_text(text, parse_mode='Markdown')
 
 def build_history_text(mess_id):
-    deposits = get_recent_deposits(mess_id, 10)
-    expenses = get_recent_expenses(mess_id, 10)
-    
-    text = f"📋 **সর্বশেষ লেনদেন** ({mess_display_label(get_mess_info(mess_id))})\n"
+    """মেস শুরু থেকে এখন পর্যন্ত সব ডিপোজিট+খরচ একসাথে, তারিখ অনুযায়ী ক্রমানুসারে (পুরনো থেকে নতুন)"""
+    deposits = get_all_deposits_asc(mess_id)
+    expenses = get_all_expenses_asc(mess_id)
+
+    events = []
+    for username, amount, date, note in deposits:
+        events.append((date, f"💰 @{username}: {amount:.2f} টাকা জমা"))
+    for desc, amount, date, added_by in expenses:
+        by_text = f" (যোগ করেছেন @{added_by})" if added_by else ""
+        events.append((date, f"💸 {desc}: {amount:.2f} টাকা খরচ{by_text}"))
+    events.sort(key=lambda e: e[0])
+
+    text = f"📋 মেসের হিস্টোরি ({mess_display_label(get_mess_info(mess_id))})\n"
     text += "="*30 + "\n\n"
-    
-    text += "💰 **ডিপোজিট:**\n"
-    if deposits:
-        for username, amount, date, note in deposits:
-            text += f"  @{username}: {amount:.2f} টাকা\n"
-            text += f"    📅 {date}\n"
+
+    if events:
+        for date, line in events:
+            text += f"📅 {date}\n{line}\n\n"
     else:
-        text += "  (কোনো ডিপোজিট নেই)\n"
-    
-    text += "\n💸 **খরচ:**\n"
-    if expenses:
-        for desc, amount, date, added_by in expenses:
-            text += f"  {desc}: {amount:.2f} টাকা\n"
-            text += f"    📅 {date}\n"
-    else:
-        text += "  (কোনো খরচ নেই)\n"
-    
-    return text
+        text += "(এখনো কোনো লেনদেন নেই)\n"
+
+    return text.rstrip()
+
+def split_long_text(text, limit=3500):
+    """টেলিগ্রামের মেসেজ-লেন্থ সীমার জন্য লম্বা টেক্সটকে লাইন-বাউন্ডারিতে কয়েকটা অংশে ভাগ করে"""
+    if len(text) <= limit:
+        return [text]
+    parts = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > limit:
+            parts.append(current.rstrip())
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        parts.append(current.rstrip())
+    return parts
 
 async def show_history(query, mess_id):
     text = build_history_text(mess_id)
-    await query.edit_message_text(text)
+    chunks = split_long_text(text)
+    await query.edit_message_text(chunks[0])
+    for chunk in chunks[1:]:
+        await query.message.reply_text(chunk)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -2786,7 +2821,8 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mess_id = await _active_mess_or_prompt(update)
     if not mess_id:
         return
-    await update.message.reply_text(build_history_text(mess_id))
+    for chunk in split_long_text(build_history_text(mess_id)):
+        await update.message.reply_text(chunk)
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -2958,13 +2994,15 @@ async def auto_nightly_digest_job(context: ContextTypes.DEFAULT_TYPE):
         if not members:
             continue
         summary_text = build_summary_text(mess['id'])
-        history_text = build_history_text(mess['id'])
+        history_chunks = split_long_text(f"🌙 রাত ১১টার দৈনিক আপডেট\n\n{build_history_text(mess['id'])}")
         if not summary_text:
             continue
         for username, member_user_id in members:
             try:
-                await context.bot.send_message(chat_id=member_user_id, text=f"🌙 রাত ১১টার দৈনিক আপডেট\n\n{summary_text}", parse_mode='Markdown')
-                await context.bot.send_message(chat_id=member_user_id, text=history_text, parse_mode='Markdown')
+                # আগে হিস্টোরি (মেস শুরু থেকে এখন পর্যন্ত, তারিখ অনুযায়ী ক্রমানুসারে), তারপর তার নিচে সারাংশ
+                for chunk in history_chunks:
+                    await context.bot.send_message(chat_id=member_user_id, text=chunk)
+                await context.bot.send_message(chat_id=member_user_id, text=summary_text, parse_mode='Markdown')
             except Exception:
                 pass
 
