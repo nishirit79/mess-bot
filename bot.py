@@ -558,14 +558,35 @@ def is_member_or_admin(user_id, mess_id):
     conn.close()
     return result is not None
 
+# ============ নাইটলি ডাইজেস্ট সেটিং (per-mess) ============
+def is_digest_enabled(mess_id):
+    """রাত ১১টার অটো ডাইজেস্ট এই মেসে চালু আছে কিনা (ডিফল্ট: চালু)"""
+    return get_setting(f'digest_enabled_{mess_id}') != '0'
+
+def set_digest_enabled(mess_id, enabled):
+    set_setting(f'digest_enabled_{mess_id}', '1' if enabled else '0')
+
+def mark_digest_dirty(mess_id):
+    """নতুন জমা/খরচ যোগ হলে চিহ্ন রাখে, যাতে রাতের ডাইজেস্ট পাঠানো হয়
+    (তারিখ পিছিয়ে দেওয়া এন্ট্রিও ধরা পড়ে, কারণ এন্ট্রি যোগ করার ঘটনাটাই ট্র্যাক হয়)"""
+    set_setting(f'digest_dirty_{mess_id}', '1')
+
+def pop_digest_dirty(mess_id):
+    """চিহ্ন আছে কিনা ফেরত দেয় এবং চিহ্নটা মুছে দেয়"""
+    was_dirty = get_setting(f'digest_dirty_{mess_id}') == '1'
+    if was_dirty:
+        set_setting(f'digest_dirty_{mess_id}', '0')
+    return was_dirty
+
 def add_deposit(username, amount, mess_id, note=""):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     date = bd_now().strftime("%Y-%m-%d %H:%M")
-    c.execute("INSERT INTO deposits (username, amount, date, note, mess_id) VALUES (?, ?, ?, ?, ?)", 
+    c.execute("INSERT INTO deposits (username, amount, date, note, mess_id) VALUES (?, ?, ?, ?, ?)",
              (username, amount, date, note, mess_id))
     conn.commit()
     conn.close()
+    mark_digest_dirty(mess_id)
 
 def add_expense(description, amount, mess_id, added_by="System", date=None):
     conn = sqlite3.connect(DB_PATH)
@@ -576,6 +597,7 @@ def add_expense(description, amount, mess_id, added_by="System", date=None):
              (description, amount, date, added_by, mess_id))
     conn.commit()
     conn.close()
+    mark_digest_dirty(mess_id)
 
 def get_total_deposits(mess_id):
     conn = sqlite3.connect(DB_PATH)
@@ -841,6 +863,7 @@ def delete_mess(mess_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM mess_settings WHERE key = ?", (f'mess_{mess_id}_info',))
+    c.execute("DELETE FROM mess_settings WHERE key IN (?, ?)", (f'digest_enabled_{mess_id}', f'digest_dirty_{mess_id}'))
     c.execute("DELETE FROM admins WHERE mess_id = ?", (mess_id,))
     c.execute("DELETE FROM users WHERE mess_id = ?", (mess_id,))
     c.execute("DELETE FROM deposits WHERE mess_id = ?", (mess_id,))
@@ -1673,6 +1696,22 @@ async def show_main_menu(message, mess_id, user_id=None):
         ]
         await message.reply_text("💸 **ধার-দেনার হিসাব**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
+def build_admin_panel(mess_id):
+    """এডমিন ম্যানেজমেন্ট প্যানেলের টেক্সট ও কিবোর্ড তৈরি করে"""
+    keyboard = [
+        [InlineKeyboardButton("👑 নতুন এডমিন বানান", callback_data=f'promote_user_{mess_id}')],
+        [InlineKeyboardButton("👤 এডমিন বাদ দিন", callback_data=f'demote_admin_{mess_id}')],
+        [InlineKeyboardButton("🗑️ ইউজার রিমুভ করুন", callback_data=f'remove_user_{mess_id}')],
+    ]
+    text = "⚙️ **এডমিন ম্যানেজমেন্ট**"
+    info = get_mess_info(mess_id)
+    if info and info.get('mess_type') not in ('personal', 'debt'):
+        digest_label = "🌙 রাতের আপডেট: চালু ✅" if is_digest_enabled(mess_id) else "🌙 রাতের আপডেট: বন্ধ ❌"
+        keyboard.append([InlineKeyboardButton(digest_label, callback_data=f'digest_toggle|{mess_id}')])
+        text += "\n\n🌙 রাত ১১টার আপডেট শুধু সেদিন জমা/খরচ যোগ হলেই সবাইকে যায়।"
+    keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data=f'back_main_{mess_id}')])
+    return text, InlineKeyboardMarkup(keyboard)
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2033,14 +2072,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id, mess_id):
             await query.answer("❌ আপনি এডমিন নন!", show_alert=True)
             return
-        keyboard = [
-            [InlineKeyboardButton("👑 নতুন এডমিন বানান", callback_data=f'promote_user_{mess_id}')],
-            [InlineKeyboardButton("👤 এডমিন বাদ দিন", callback_data=f'demote_admin_{mess_id}')],
-            [InlineKeyboardButton("🗑️ ইউজার রিমুভ করুন", callback_data=f'remove_user_{mess_id}')],
-            [InlineKeyboardButton("🔙 ব্যাক", callback_data=f'back_main_{mess_id}')]
-        ]
-        await query.edit_message_text("⚙️ **এডমিন ম্যানেজমেন্ট**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    
+        text, markup = build_admin_panel(mess_id)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
+
+    elif data.startswith('digest_toggle|'):
+        mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ আপনি এডমিন নন!", show_alert=True)
+            return
+        set_digest_enabled(mess_id, not is_digest_enabled(mess_id))
+        text, markup = build_admin_panel(mess_id)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
+
     elif data.startswith('promote_user_'):
         mess_id = int(data.replace('promote_user_', ''))
         if not is_admin(user_id, mess_id):
@@ -2990,6 +3033,11 @@ async def auto_nightly_digest_job(context: ContextTypes.DEFAULT_TYPE):
             continue
         if is_mess_completed(mess['id']):
             continue
+        if not is_digest_enabled(mess['id']):
+            continue
+        # আজ কোনো জমা/খরচ যোগ না হলে ডাইজেস্ট পাঠানো হবে না
+        if not pop_digest_dirty(mess['id']):
+            continue
         members = get_users_with_ids(mess['id'])
         if not members:
             continue
@@ -3199,12 +3247,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id, mess_id):
         await update.message.reply_text("❌ আপনি এডমিন নন!")
         return
-    keyboard = [
-        [InlineKeyboardButton("👑 নতুন এডমিন বানান", callback_data=f'promote_user_{mess_id}')],
-        [InlineKeyboardButton("👤 এডমিন বাদ দিন", callback_data=f'demote_admin_{mess_id}')],
-        [InlineKeyboardButton("🗑️ ইউজার রিমুভ করুন", callback_data=f'remove_user_{mess_id}')]
-    ]
-    await update.message.reply_text("⚙️ **এডমিন ম্যানেজমেন্ট**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    text, markup = build_admin_panel(mess_id)
+    await update.message.reply_text(text, reply_markup=markup, parse_mode='Markdown')
 
 async def endmess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mess_id = await _active_mess_or_prompt(update)
