@@ -1702,14 +1702,45 @@ def build_admin_panel(mess_id):
         [InlineKeyboardButton("👑 নতুন এডমিন বানান", callback_data=f'promote_user_{mess_id}')],
         [InlineKeyboardButton("👤 এডমিন বাদ দিন", callback_data=f'demote_admin_{mess_id}')],
         [InlineKeyboardButton("🗑️ ইউজার রিমুভ করুন", callback_data=f'remove_user_{mess_id}')],
+        [InlineKeyboardButton("🔙 ব্যাক", callback_data=f'back_main_{mess_id}')],
     ]
-    text = "⚙️ **এডমিন ম্যানেজমেন্ট**"
-    info = get_mess_info(mess_id)
-    if info and info.get('mess_type') not in ('personal', 'debt'):
-        digest_label = "🌙 রাতের আপডেট: চালু ✅" if is_digest_enabled(mess_id) else "🌙 রাতের আপডেট: বন্ধ ❌"
-        keyboard.append([InlineKeyboardButton(digest_label, callback_data=f'digest_toggle|{mess_id}')])
-        text += "\n\n🌙 রাত ১১টার আপডেট শুধু সেদিন জমা/খরচ যোগ হলেই সবাইকে যায়।"
-    keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data=f'back_main_{mess_id}')])
+    return "⚙️ **এডমিন ম্যানেজমেন্ট**", InlineKeyboardMarkup(keyboard)
+
+def build_myaccounts_view(user_id):
+    """'আমার মেস' তালিকার (টেক্সট, কিবোর্ড) তৈরি করে; কোনো মেস না থাকলে None"""
+    messes = sort_messes_grouped_by_type(get_user_messes(user_id))
+    if not messes:
+        return None
+    keyboard = []
+    for mess in messes:
+        status = "✅" if mess['end_date'] != 'চলমান' else "🟢"
+        row = [InlineKeyboardButton(
+            f"{status} {mess_display_label(mess)} - {mess['month_name']}",
+            callback_data=f'switch_mess_{mess["id"]}'
+        )]
+        if is_admin(user_id, mess['id']):
+            if mess.get('mess_type') not in ('personal', 'debt'):
+                row.append(InlineKeyboardButton("⚙️", callback_data=f'mess_settings|{mess["id"]}'))
+            row.append(InlineKeyboardButton("🗑️", callback_data=f'del_mess|{mess["id"]}'))
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
+    text = ("📂 **আপনার মেসসমূহ:**\n\n"
+            "⚙️ মেস সেটিংস (শুধু এডমিন)\n"
+            "🗑️ অপ্রয়োজনীয় মেস স্থায়ীভাবে ডিলিট (শুধু এডমিন)")
+    return text, InlineKeyboardMarkup(keyboard)
+
+def build_mess_settings_view(mess_id):
+    """একটা মেসের সেটিংস স্ক্রিনের (টেক্সট, কিবোর্ড)"""
+    label = mess_display_label(get_mess_info(mess_id))
+    on = is_digest_enabled(mess_id)
+    toggle = "🌙 রাতের আপডেট: চালু ✅" if on else "🌙 রাতের আপডেট: বন্ধ ❌"
+    keyboard = [
+        [InlineKeyboardButton(toggle, callback_data=f'digest_toggle|{mess_id}')],
+        [InlineKeyboardButton("🔙 ব্যাক", callback_data='my_accounts_back')],
+    ]
+    text = (f"⚙️ **{label} — মেস সেটিংস**\n\n"
+            "🌙 **রাতের আপডেট:** রাত ১১টায় সবার কাছে হিস্টোরি ও সারাংশ যায়, "
+            "তবে শুধু সেদিন জমা/খরচ যোগ হলেই। বাটনে ট্যাপ করে চালু/বন্ধ করুন।")
     return text, InlineKeyboardMarkup(keyboard)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1804,25 +1835,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == 'my_accounts_back':
-        messes = sort_messes_grouped_by_type(get_user_messes(user_id))
-        if not messes:
+        view = build_myaccounts_view(user_id)
+        if not view:
             await query.edit_message_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন।")
             return
-        keyboard = []
-        for mess in messes:
-            status = "✅" if mess['end_date'] != 'চলমান' else "🟢"
-            row = [InlineKeyboardButton(
-                f"{status} {mess_display_label(mess)} - {mess['month_name']}",
-                callback_data=f'switch_mess_{mess["id"]}'
-            )]
-            if is_admin(user_id, mess['id']):
-                row.append(InlineKeyboardButton("🗑️", callback_data=f'del_mess|{mess["id"]}'))
-            keyboard.append(row)
-        keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
-        await query.edit_message_text(
-            "📂 **আপনার মেসসমূহ:**\n\n🗑️ বাটনে ক্লিক করে অপ্রয়োজনীয় মেস স্থায়ীভাবে ডিলিট করতে পারবেন (শুধু এডমিন)।",
-            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
-        )
+        text, markup = view
+        await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
 
     elif data == 'back_start':
         await start(update, context)
@@ -2075,13 +2093,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = build_admin_panel(mess_id)
         await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
 
+    elif data.startswith('mess_settings|'):
+        mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ শুধুমাত্র এডমিন সেটিংস বদলাতে পারবেন!", show_alert=True)
+            return
+        text, markup = build_mess_settings_view(mess_id)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
+
     elif data.startswith('digest_toggle|'):
         mess_id = int(data.split('|')[1])
         if not is_admin(user_id, mess_id):
-            await query.answer("❌ আপনি এডমিন নন!", show_alert=True)
+            await query.answer("❌ শুধুমাত্র এডমিন সেটিংস বদলাতে পারবেন!", show_alert=True)
             return
         set_digest_enabled(mess_id, not is_digest_enabled(mess_id))
-        text, markup = build_admin_panel(mess_id)
+        text, markup = build_mess_settings_view(mess_id)
         await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
 
     elif data.startswith('promote_user_'):
@@ -2759,26 +2785,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _debt_show_person_detail(update.message, context, entry['mess_id'], entry['person_name'], edit=False)
 
 async def myaccounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    messes = sort_messes_grouped_by_type(get_user_messes(user_id))
-    if not messes:
+    view = build_myaccounts_view(update.effective_user.id)
+    if not view:
         await update.message.reply_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন।")
         return
-    keyboard = []
-    for mess in messes:
-        status = "✅" if mess['end_date'] != 'চলমান' else "🟢"
-        row = [InlineKeyboardButton(
-            f"{status} {mess_display_label(mess)} - {mess['month_name']}",
-            callback_data=f'switch_mess_{mess["id"]}'
-        )]
-        if is_admin(user_id, mess['id']):
-            row.append(InlineKeyboardButton("🗑️", callback_data=f'del_mess|{mess["id"]}'))
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
-    await update.message.reply_text(
-        "📂 **আপনার মেসসমূহ:**\n\n🗑️ বাটনে ক্লিক করে অপ্রয়োজনীয় মেস স্থায়ীভাবে ডিলিট করতে পারবেন (শুধু এডমিন)।",
-        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
-    )
+    text, markup = view
+    await update.message.reply_text(text, reply_markup=markup, parse_mode='Markdown')
 
 async def _active_mess_or_prompt(update: Update):
     """বর্তমান সক্রিয় মেস রিটার্ন করে; না থাকলে ইউজারকে জানিয়ে None রিটার্ন করে।"""
