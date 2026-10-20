@@ -74,6 +74,10 @@ def bn_text(text, size=11, bold=False, color=(0, 0, 0)):
 DB_PATH = '/app/data/mess.db' if os.path.exists('/app/data') else 'mess.db'
 
 # ============ ডেটাবেস ফাংশন ============
+# হিসাবে ধরা হবে শুধু যাদের নাম এখনো মেসের সদস্য-তালিকায় (users) আছে —
+# ছেড়ে যাওয়া সদস্য তালিকায় থাকে (তাই হিসাবে থাকে), এডমিন রিমুভ করলে তালিকা থেকে যায় (তাই হিসাব থেকে বাদ)
+IN_USERS = "username IN (SELECT username FROM users WHERE mess_id = ?)"
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH) if '/' in DB_PATH else '.', exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -122,6 +126,9 @@ def init_db():
     user_columns = [col[1] for col in c.fetchall()]
     if 'user_id' not in user_columns:
         c.execute("ALTER TABLE users ADD COLUMN user_id INTEGER")
+    if 'left_date' not in user_columns:
+        # মেস ছেড়ে যাওয়ার তারিখ (NULL = সক্রিয় সদস্য)
+        c.execute("ALTER TABLE users ADD COLUMN left_date TEXT")
     
     c.execute('''CREATE TABLE IF NOT EXISTS deposits (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -342,7 +349,7 @@ def get_user_messes(user_id):
     c = conn.cursor()
     c.execute("""SELECT DISTINCT mess_id FROM admins WHERE user_id = ?
                  UNION
-                 SELECT DISTINCT mess_id FROM users WHERE user_id = ?""", (user_id, user_id))
+                 SELECT DISTINCT mess_id FROM users WHERE user_id = ? AND left_date IS NULL""", (user_id, user_id))
     mess_ids = [row[0] for row in c.fetchall()]
     conn.close()
     
@@ -381,7 +388,7 @@ def get_users_with_ids(mess_id):
     """(username, user_id) - শুধু যাদের telegram user_id লিংক করা আছে (তাদেরই DM পাঠানো সম্ভব)"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT username, user_id FROM users WHERE mess_id = ? AND user_id IS NOT NULL", (mess_id,))
+    c.execute("SELECT username, user_id FROM users WHERE mess_id = ? AND user_id IS NOT NULL AND left_date IS NULL", (mess_id,))
     users = c.fetchall()
     conn.close()
     return users
@@ -390,6 +397,16 @@ def add_user(username, mess_id, full_name=None, user_id=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
+        c.execute("SELECT left_date FROM users WHERE username = ? AND mess_id = ?", (username, mess_id))
+        existing = c.fetchone()
+        if existing:
+            if existing[0] is None:
+                return False  # আগে থেকেই সক্রিয় সদস্য
+            # মেস ছেড়ে যাওয়া সদস্যকে আবার যোগ করলে আগের হিসাবসহ সক্রিয় হয়ে যায়
+            c.execute("UPDATE users SET left_date = NULL, user_id = COALESCE(?, user_id) WHERE username = ? AND mess_id = ?",
+                      (user_id, username, mess_id))
+            conn.commit()
+            return True
         c.execute("INSERT INTO users (username, full_name, mess_id, added_date, user_id) VALUES (?, ?, ?, ?, ?)", 
                  (username, full_name or username, mess_id, bd_now().strftime("%Y-%m-%d %H:%M"), user_id))
         conn.commit()
@@ -503,6 +520,41 @@ def remove_user(username, mess_id):
     conn.commit()
     conn.close()
 
+def get_left_usernames(mess_id):
+    """যারা মেস ছেড়ে গেছে কিন্তু হিসাবে আছে"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username FROM users WHERE mess_id = ? AND left_date IS NOT NULL", (mess_id,))
+    names = {row[0] for row in c.fetchall()}
+    conn.close()
+    return names
+
+def get_member_username(user_id, mess_id):
+    """সক্রিয় সদস্যের username (না থাকলে None)"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username FROM users WHERE user_id = ? AND mess_id = ? AND left_date IS NULL", (user_id, mess_id))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def leave_mess_member(user_id, mess_id):
+    """সদস্য মেস ছাড়ে: সে আর মেস দেখতে/আপডেট পেতে পারে না, কিন্তু আগের জমা-মিল ও ভাগাভাগির হিসাবে থেকে যায়।
+    সফল হলে username ফেরত দেয়; এডমিন বা সক্রিয় সদস্য না হলে None"""
+    if is_admin(user_id, mess_id):
+        return None
+    username = get_member_username(user_id, mess_id)
+    if not username:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET left_date = ? WHERE user_id = ? AND mess_id = ? AND left_date IS NULL",
+              (bd_now().strftime("%Y-%m-%d"), user_id, mess_id))
+    c.execute("UPDATE user_state SET current_mess_id = NULL WHERE user_id = ? AND current_mess_id = ?", (user_id, mess_id))
+    conn.commit()
+    conn.close()
+    return username
+
 # ============ এডমিন ফাংশন (per-mess) ============
 def is_admin(user_id, mess_id):
     conn = sqlite3.connect(DB_PATH)
@@ -553,7 +605,7 @@ def is_member_or_admin(user_id, mess_id):
         return True
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT 1 FROM users WHERE user_id = ? AND mess_id = ?", (user_id, mess_id))
+    c.execute("SELECT 1 FROM users WHERE user_id = ? AND mess_id = ? AND left_date IS NULL", (user_id, mess_id))
     result = c.fetchone()
     conn.close()
     return result is not None
@@ -577,6 +629,13 @@ def pop_digest_dirty(mess_id):
     if was_dirty:
         set_setting(f'digest_dirty_{mess_id}', '0')
     return was_dirty
+
+def is_user_digest_on(mess_id, user_id):
+    """এই সদস্য নিজের জন্য রাতের আপডেট চালু রেখেছে কিনা (ডিফল্ট: চালু)"""
+    return get_setting(f'digest_user_off_{mess_id}_{user_id}') != '1'
+
+def set_user_digest(mess_id, user_id, enabled):
+    set_setting(f'digest_user_off_{mess_id}_{user_id}', '0' if enabled else '1')
 
 def add_deposit(username, amount, mess_id, note=""):
     conn = sqlite3.connect(DB_PATH)
@@ -602,7 +661,7 @@ def add_expense(description, amount, mess_id, added_by="System", date=None):
 def get_total_deposits(mess_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT SUM(amount) FROM deposits WHERE mess_id = ?", (mess_id,))
+    c.execute("SELECT SUM(amount) FROM deposits WHERE mess_id = ? AND " + IN_USERS, (mess_id, mess_id))
     total = c.fetchone()[0] or 0
     conn.close()
     return total
@@ -651,10 +710,10 @@ def get_expenses_with_date(mess_id, start_date, end_date):
 def get_deposits_with_date(mess_id, start_date, end_date):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""SELECT username, amount, date, note FROM deposits 
-                 WHERE mess_id = ? AND date BETWEEN ? AND ?
-                 ORDER BY date""", 
-              (mess_id, start_date, end_date))
+    c.execute("""SELECT username, amount, date, note FROM deposits
+                 WHERE mess_id = ? AND date BETWEEN ? AND ? AND """ + IN_USERS + """
+                 ORDER BY date""",
+              (mess_id, start_date, end_date, mess_id))
     data = c.fetchall()
     conn.close()
     return data
@@ -662,8 +721,8 @@ def get_deposits_with_date(mess_id, start_date, end_date):
 def get_recent_deposits(mess_id, limit=10):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT username, amount, date, note FROM deposits WHERE mess_id = ? ORDER BY date DESC LIMIT ?", 
-             (mess_id, limit))
+    c.execute("SELECT username, amount, date, note FROM deposits WHERE mess_id = ? AND " + IN_USERS + " ORDER BY date DESC LIMIT ?",
+             (mess_id, mess_id, limit))
     data = c.fetchall()
     conn.close()
     return data
@@ -681,7 +740,7 @@ def get_all_deposits_asc(mess_id):
     """মেস শুরু থেকে এখন পর্যন্ত সব ডিপোজিট, পুরনো থেকে নতুন (তারিখ অনুযায়ী ক্রমানুসারে)"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT username, amount, date, note FROM deposits WHERE mess_id = ? ORDER BY date ASC", (mess_id,))
+    c.execute("SELECT username, amount, date, note FROM deposits WHERE mess_id = ? AND " + IN_USERS + " ORDER BY date ASC", (mess_id, mess_id))
     data = c.fetchall()
     conn.close()
     return data
@@ -732,8 +791,8 @@ def get_mills_with_date(mess_id, start_date, end_date):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""SELECT username, mill_date, mill_count FROM mills
-                 WHERE mess_id = ? AND mill_date >= ? AND mill_date <= ?
-                 ORDER BY mill_date""", (mess_id, start_date, end_date))
+                 WHERE mess_id = ? AND mill_date >= ? AND mill_date <= ? AND """ + IN_USERS + """
+                 ORDER BY mill_date""", (mess_id, start_date, end_date, mess_id))
     data = c.fetchall()
     conn.close()
     return data
@@ -752,8 +811,8 @@ def get_total_mills(mess_id, start_date, end_date):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""SELECT COALESCE(SUM(mill_count), 0) FROM mills
-                 WHERE mess_id = ? AND mill_date >= ? AND mill_date <= ?""",
-              (mess_id, start_date, end_date))
+                 WHERE mess_id = ? AND mill_date >= ? AND mill_date <= ? AND """ + IN_USERS,
+              (mess_id, start_date, end_date, mess_id))
     total = c.fetchone()[0]
     conn.close()
     return total
@@ -771,8 +830,8 @@ def get_daily_mill_totals(mess_id, start_date, end_date):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""SELECT mill_date, SUM(mill_count) FROM mills
-                 WHERE mess_id = ? AND mill_date >= ? AND mill_date <= ?
-                 GROUP BY mill_date ORDER BY mill_date""", (mess_id, start_date, end_date))
+                 WHERE mess_id = ? AND mill_date >= ? AND mill_date <= ? AND """ + IN_USERS + """
+                 GROUP BY mill_date ORDER BY mill_date""", (mess_id, start_date, end_date, mess_id))
     data = {row[0]: row[1] for row in c.fetchall()}
     conn.close()
     return data
@@ -813,7 +872,8 @@ def get_daily_default_mills(mess_id, usernames):
 def auto_fill_missing_mills_for_date(mess_id, mill_date):
     """যাদের জন্য এখনো এই তারিখে কোনো মিল এন্ট্রি হয়নি (admin ম্যানুয়াল দেয়নি), তাদের জন্য
     প্রিসেট অনুযায়ী অটো-ফিল করে। যাদের ইতিমধ্যে এন্ট্রি আছে (admin এর ব্যতিক্রম সহ) তা বদলায় না।"""
-    usernames = [u for u, _ in get_users(mess_id)]
+    left = get_left_usernames(mess_id)
+    usernames = [u for u, _ in get_users(mess_id) if u not in left]
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     filled = []
@@ -864,6 +924,8 @@ def delete_mess(mess_id):
     c = conn.cursor()
     c.execute("DELETE FROM mess_settings WHERE key = ?", (f'mess_{mess_id}_info',))
     c.execute("DELETE FROM mess_settings WHERE key IN (?, ?)", (f'digest_enabled_{mess_id}', f'digest_dirty_{mess_id}'))
+    off_prefix = f'digest_user_off_{mess_id}_'
+    c.execute("DELETE FROM mess_settings WHERE substr(key, 1, ?) = ?", (len(off_prefix), off_prefix))
     c.execute("DELETE FROM admins WHERE mess_id = ?", (mess_id,))
     c.execute("DELETE FROM users WHERE mess_id = ?", (mess_id,))
     c.execute("DELETE FROM deposits WHERE mess_id = ?", (mess_id,))
@@ -1565,7 +1627,7 @@ async def finalize_renew(reply_target, context, user_id, old_mess_id, start_date
     # পুরনো মেসের সব সদস্য কপি (ইউজার আইডি সহ)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT username, full_name, user_id FROM users WHERE mess_id = ?", (old_mess_id,))
+    c.execute("SELECT username, full_name, user_id FROM users WHERE mess_id = ? AND left_date IS NULL", (old_mess_id,))
     old_users = c.fetchall()
     conn.close()
     for username, full_name, member_user_id in old_users:
@@ -1718,29 +1780,43 @@ def build_myaccounts_view(user_id):
             f"{status} {mess_display_label(mess)} - {mess['month_name']}",
             callback_data=f'switch_mess_{mess["id"]}'
         )]
+        if mess.get('mess_type') not in ('personal', 'debt'):
+            row.append(InlineKeyboardButton("⚙️", callback_data=f'mess_settings|{mess["id"]}'))
         if is_admin(user_id, mess['id']):
-            if mess.get('mess_type') not in ('personal', 'debt'):
-                row.append(InlineKeyboardButton("⚙️", callback_data=f'mess_settings|{mess["id"]}'))
             row.append(InlineKeyboardButton("🗑️", callback_data=f'del_mess|{mess["id"]}'))
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
     text = ("📂 **আপনার মেসসমূহ:**\n\n"
-            "⚙️ মেস সেটিংস (শুধু এডমিন)\n"
+            "⚙️ মেস সেটিংস (রাতের আপডেট চালু/বন্ধ, মেস ছাড়া)\n"
             "🗑️ অপ্রয়োজনীয় মেস স্থায়ীভাবে ডিলিট (শুধু এডমিন)")
     return text, InlineKeyboardMarkup(keyboard)
 
-def build_mess_settings_view(mess_id):
-    """একটা মেসের সেটিংস স্ক্রিনের (টেক্সট, কিবোর্ড)"""
+def build_mess_settings_view(mess_id, user_id):
+    """একটা মেসের সেটিংস স্ক্রিনের (টেক্সট, কিবোর্ড) — সদস্য ও এডমিন ভেদে আলাদা অপশন"""
     label = mess_display_label(get_mess_info(mess_id))
-    on = is_digest_enabled(mess_id)
-    toggle = "🌙 রাতের আপডেট: চালু ✅" if on else "🌙 রাতের আপডেট: বন্ধ ❌"
-    keyboard = [
-        [InlineKeyboardButton(toggle, callback_data=f'digest_toggle|{mess_id}')],
-        [InlineKeyboardButton("🔙 ব্যাক", callback_data='my_accounts_back')],
-    ]
-    text = (f"⚙️ **{label} — মেস সেটিংস**\n\n"
-            "🌙 **রাতের আপডেট:** রাত ১১টায় সবার কাছে হিস্টোরি ও সারাংশ যায়, "
-            "তবে শুধু সেদিন জমা/খরচ যোগ হলেই। বাটনে ট্যাপ করে চালু/বন্ধ করুন।")
+    admin = is_admin(user_id, mess_id)
+    keyboard = []
+    text = f"⚙️ **{label} — মেস সেটিংস**\n\n"
+
+    my_on = is_user_digest_on(mess_id, user_id)
+    keyboard.append([InlineKeyboardButton(
+        "🌙 আমার রাতের আপডেট: চালু ✅" if my_on else "🌙 আমার রাতের আপডেট: বন্ধ ❌",
+        callback_data=f'my_digest_toggle|{mess_id}')])
+    text += ("🌙 **রাতের আপডেট:** রাত ১১টায় হিস্টোরি ও সারাংশ আসে — তবে শুধু সেদিন জমা/খরচ যোগ হলেই। "
+             "নিজের জন্য বাটনে ট্যাপ করে চালু/বন্ধ করুন।\n")
+
+    if admin:
+        mess_on = is_digest_enabled(mess_id)
+        keyboard.append([InlineKeyboardButton(
+            "👥 সবার জন্য রাতের আপডেট: চালু ✅" if mess_on else "👥 সবার জন্য রাতের আপডেট: বন্ধ ❌",
+            callback_data=f'digest_toggle|{mess_id}')])
+        text += "\n👥 **সবার জন্য** বন্ধ করলে মেসের কেউই রাতের আপডেট পাবে না (শুধু এডমিন বদলাতে পারে)।\n"
+    else:
+        keyboard.append([InlineKeyboardButton("🚪 মেস ছাড়ুন", callback_data=f'leave_mess|{mess_id}')])
+        text += ("\n🚪 **মেস ছাড়লে** আপনি আর এই মেস দেখতে বা আপডেট পাবেন না, তবে আগের জমা ও মিলসহ "
+                 "আপনার হিসাব মেসের হিসাবে থেকে যাবে।\n")
+
+    keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data='my_accounts_back')])
     return text, InlineKeyboardMarkup(keyboard)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2095,20 +2171,66 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith('mess_settings|'):
         mess_id = int(data.split('|')[1])
-        if not is_admin(user_id, mess_id):
-            await query.answer("❌ শুধুমাত্র এডমিন সেটিংস বদলাতে পারবেন!", show_alert=True)
+        if not is_member_or_admin(user_id, mess_id):
+            await query.answer("❌ আপনি এই মেসের সদস্য নন!", show_alert=True)
             return
-        text, markup = build_mess_settings_view(mess_id)
+        text, markup = build_mess_settings_view(mess_id, user_id)
         await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
 
     elif data.startswith('digest_toggle|'):
         mess_id = int(data.split('|')[1])
         if not is_admin(user_id, mess_id):
-            await query.answer("❌ শুধুমাত্র এডমিন সেটিংস বদলাতে পারবেন!", show_alert=True)
+            await query.answer("❌ শুধুমাত্র এডমিন সবার জন্য বদলাতে পারবেন!", show_alert=True)
             return
         set_digest_enabled(mess_id, not is_digest_enabled(mess_id))
-        text, markup = build_mess_settings_view(mess_id)
+        text, markup = build_mess_settings_view(mess_id, user_id)
         await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
+
+    elif data.startswith('my_digest_toggle|'):
+        mess_id = int(data.split('|')[1])
+        if not is_member_or_admin(user_id, mess_id):
+            await query.answer("❌ আপনি এই মেসের সদস্য নন!", show_alert=True)
+            return
+        set_user_digest(mess_id, user_id, not is_user_digest_on(mess_id, user_id))
+        text, markup = build_mess_settings_view(mess_id, user_id)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
+
+    elif data.startswith('leave_mess|'):
+        mess_id = int(data.split('|')[1])
+        if is_admin(user_id, mess_id):
+            await query.answer("❌ এডমিন সরাসরি মেস ছাড়তে পারবেন না — আগে অন্য এডমিন আপনাকে এডমিন থেকে বাদ দিন।", show_alert=True)
+            return
+        if not get_member_username(user_id, mess_id):
+            await query.answer("❌ আপনি এই মেসের সদস্য নন!", show_alert=True)
+            return
+        label = mess_display_label(get_mess_info(mess_id))
+        keyboard = [
+            [InlineKeyboardButton("✅ হ্যাঁ, মেস ছাড়ব", callback_data=f'leave_confirm|{mess_id}')],
+            [InlineKeyboardButton("❌ না", callback_data=f'mess_settings|{mess_id}')]
+        ]
+        await query.edit_message_text(
+            f"🚪 **{label}** ছেড়ে দিতে চান?\n\n"
+            "• আপনি আর মেস দেখতে বা রাতের আপডেট পাবেন না\n"
+            "• আপনার আগের জমা ও মিলসহ হিসাব মেসের হিসাবে থেকে যাবে\n"
+            "• এডমিন আবার যোগ করলে ফিরে আসতে পারবেন",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+        )
+
+    elif data.startswith('leave_confirm|'):
+        mess_id = int(data.split('|')[1])
+        label = mess_display_label(get_mess_info(mess_id))
+        username = leave_mess_member(user_id, mess_id)
+        if not username:
+            await query.answer("❌ মেস ছাড়া যায়নি!", show_alert=True)
+            return
+        await query.edit_message_text(f"🚪 আপনি **{label}** ছেড়ে দিয়েছেন।\n\nআপনার হিসাব মেসের হিসাবে থেকে যাবে।", parse_mode='Markdown')
+        for admin_uid, _ in get_admins(mess_id):
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_uid,
+                    text=f"🚪 @{username} {label} ছেড়ে গেছে।\nতার হিসাব মেসের হিসাবে থাকবে। হিসাব থেকে বাদ দিতে চাইলে ⚙️ এডমিন → ইউজার রিমুভ করুন।")
+            except Exception:
+                pass
 
     elif data.startswith('promote_user_'):
         mess_id = int(data.replace('promote_user_', ''))
@@ -2176,11 +2298,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not users:
             await query.edit_message_text("❌ কোনো ইউজার নেই!")
             return
+        left = get_left_usernames(mess_id)
         keyboard = []
         for username, full_name in users:
-            keyboard.append([InlineKeyboardButton(f"@{username}", callback_data=f'confirmremove_{mess_id}_{username}')])
+            tag = " 🚪 (ছেড়ে গেছে)" if username in left else ""
+            keyboard.append([InlineKeyboardButton(f"@{username}{tag}", callback_data=f'confirmremove_{mess_id}_{username}')])
         keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data=f'admin_panel_{mess_id}')])
-        await query.edit_message_text("🗑️ **কোন ইউজার রিমুভ করবেন?**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await query.edit_message_text(
+            "🗑️ **কোন ইউজার রিমুভ করবেন?**\n\n⚠️ রিমুভ করলে তার জমা ও মিল হিসাব থেকে বাদ যাবে। "
+            "শুধু মেস ছাড়তে চাইলে সে নিজেই ⚙️ সেটিংস থেকে ছাড়তে পারবে (তখন হিসাবে থাকবে)।",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     
     elif data.startswith('confirmremove_'):
         parts = data.split('_')
@@ -2427,11 +2554,15 @@ def build_summary_text(mess_id):
     text += f"📅 সময়কাল: {mess_info['start_date']} - {mess_info['end_date']}\n"
     text += "="*30 + "\n\n"
     
+    left = get_left_usernames(mess_id)
+    def _tag(u):
+        return " 🚪" if u in left else ""
+
     text += "💰 **ডিপোজিটের তালিকা:**\n"
     if users:
         for username, full_name in users:
             dep = get_user_deposits(username, mess_id)
-            text += f"  @{username}: {dep:.2f} টাকা\n"
+            text += f"  @{username}{_tag(username)}: {dep:.2f} টাকা\n"
     else:
         text += "  (কোনো ইউজার নেই)\n"
     
@@ -2462,9 +2593,9 @@ def build_summary_text(mess_id):
                 user_mills = get_user_mill_total(mess_id, username, s_date, e_date)
                 diff = dep - (user_mills * per_mill)
                 if diff >= 0:
-                    text += f"  @{username}: {user_mills:g} মিল, +{diff:.2f} টাকা (ফেরত পাবে)\n"
+                    text += f"  @{username}{_tag(username)}: {user_mills:g} মিল, +{diff:.2f} টাকা (ফেরত পাবে)\n"
                 else:
-                    text += f"  @{username}: {user_mills:g} মিল, {diff:.2f} টাকা (দিতে হবে)\n"
+                    text += f"  @{username}{_tag(username)}: {user_mills:g} মিল, {diff:.2f} টাকা (দিতে হবে)\n"
     
     # মাথাপিছু হিসাব — শুধু খরচ ৫০০০ টাকা বা তার বেশি হলে দেখাবে (simple/personal মেসের জন্য)
     if mess_type != 'student' and users and total_exp >= 5000:
@@ -2475,10 +2606,13 @@ def build_summary_text(mess_id):
             dep = get_user_deposits(username, mess_id)
             diff = dep - per_head
             if diff >= 0:
-                text += f"  @{username}: +{diff:.2f} টাকা (ফেরত পাবে)\n"
+                text += f"  @{username}{_tag(username)}: +{diff:.2f} টাকা (ফেরত পাবে)\n"
             else:
-                text += f"  @{username}: {diff:.2f} টাকা (দিতে হবে)\n"
-    
+                text += f"  @{username}{_tag(username)}: {diff:.2f} টাকা (দিতে হবে)\n"
+
+    if left:
+        text += "\n\n🚪 = মেস ছেড়ে গেছে, তবে হিসাবে আছে"
+
     return text
 
 async def show_summary(query, mess_id):
@@ -3058,6 +3192,8 @@ async def auto_nightly_digest_job(context: ContextTypes.DEFAULT_TYPE):
         if not summary_text:
             continue
         for username, member_user_id in members:
+            if not is_user_digest_on(mess['id'], member_user_id):
+                continue
             try:
                 # আগে হিস্টোরি (মেস শুরু থেকে এখন পর্যন্ত, তারিখ অনুযায়ী ক্রমানুসারে), তারপর তার নিচে সারাংশ
                 for chunk in history_chunks:
