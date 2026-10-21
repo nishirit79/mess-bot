@@ -129,6 +129,12 @@ def init_db():
     if 'left_date' not in user_columns:
         # মেস ছেড়ে যাওয়ার তারিখ (NULL = সক্রিয় সদস্য)
         c.execute("ALTER TABLE users ADD COLUMN left_date TEXT")
+    if 'ended_date' not in user_columns:
+        # "মেস শেষ" করার তারিখ — মেসে থাকে, কিন্তু তার নামে নতুন কিছু যোগ হয় না
+        c.execute("ALTER TABLE users ADD COLUMN ended_date TEXT")
+    if 'ended_by' not in user_columns:
+        # 'self' = সদস্য নিজে শেষ করেছে (রিনিউতে সাথে যাবে), 'admin' = এডমিন শেষ করেছে (রিনিউতে যাবে না)
+        c.execute("ALTER TABLE users ADD COLUMN ended_by TEXT")
     
     c.execute('''CREATE TABLE IF NOT EXISTS deposits (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -397,13 +403,14 @@ def add_user(username, mess_id, full_name=None, user_id=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute("SELECT left_date FROM users WHERE username = ? AND mess_id = ?", (username, mess_id))
+        c.execute("SELECT left_date, ended_date FROM users WHERE username = ? AND mess_id = ?", (username, mess_id))
         existing = c.fetchone()
         if existing:
-            if existing[0] is None:
+            if existing[0] is None and existing[1] is None:
                 return False  # আগে থেকেই সক্রিয় সদস্য
-            # মেস ছেড়ে যাওয়া সদস্যকে আবার যোগ করলে আগের হিসাবসহ সক্রিয় হয়ে যায়
-            c.execute("UPDATE users SET left_date = NULL, user_id = COALESCE(?, user_id) WHERE username = ? AND mess_id = ?",
+            # মেস ছেড়ে যাওয়া/শেষ করা সদস্যকে আবার যোগ করলে আগের হিসাবসহ সক্রিয় হয়ে যায়
+            c.execute("""UPDATE users SET left_date = NULL, ended_date = NULL, ended_by = NULL,
+                         user_id = COALESCE(?, user_id) WHERE username = ? AND mess_id = ?""",
                       (user_id, username, mess_id))
             conn.commit()
             return True
@@ -528,6 +535,46 @@ def get_left_usernames(mess_id):
     names = {row[0] for row in c.fetchall()}
     conn.close()
     return names
+
+def get_active_users(mess_id):
+    """(username, full_name) — যাদের নামে নতুন জমা/মিল যোগ করা যাবে: ছেড়ে যাওয়া বা মেস শেষ করা সদস্য বাদে।
+    হিসাব (সারাংশ/ভাগ/PDF) এর জন্য get_users() ব্যবহার হয়, যেখানে এরা থাকে"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username, full_name FROM users WHERE mess_id = ? AND left_date IS NULL AND ended_date IS NULL", (mess_id,))
+    users = c.fetchall()
+    conn.close()
+    return users
+
+def get_ended_usernames(mess_id):
+    """{username: 'self'|'admin'} — যারা 'মেস শেষ' করেছে কিন্তু এখনো মেসে আছে"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username, ended_by FROM users WHERE mess_id = ? AND ended_date IS NOT NULL AND left_date IS NULL", (mess_id,))
+    data = {row[0]: row[1] for row in c.fetchall()}
+    conn.close()
+    return data
+
+def end_member(mess_id, username, by):
+    """সদস্যের 'মেস শেষ': সে মেসে থাকে ও হিসাবে থাকে, কিন্তু নতুন কিছু তার নামে যোগ হয় না।
+    by='self' হলে রিনিউতে সাথে যায়; by='admin' হলে চলমান হিসাবের পরে আর কোনো হিসাবে যায় না।
+    সফল হলে True; এডমিন/অজানা/ইতিমধ্যে শেষ/ছেড়ে যাওয়া সদস্য হলে False"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE username = ? AND mess_id = ? AND left_date IS NULL AND ended_date IS NULL",
+              (username, mess_id))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False
+    if row[0] is not None and is_admin(row[0], mess_id):
+        conn.close()
+        return False
+    c.execute("UPDATE users SET ended_date = ?, ended_by = ? WHERE username = ? AND mess_id = ?",
+              (bd_now().strftime("%Y-%m-%d"), by, username, mess_id))
+    conn.commit()
+    conn.close()
+    return True
 
 def get_member_username(user_id, mess_id):
     """সক্রিয় সদস্যের username (না থাকলে None)"""
@@ -872,8 +919,7 @@ def get_daily_default_mills(mess_id, usernames):
 def auto_fill_missing_mills_for_date(mess_id, mill_date):
     """যাদের জন্য এখনো এই তারিখে কোনো মিল এন্ট্রি হয়নি (admin ম্যানুয়াল দেয়নি), তাদের জন্য
     প্রিসেট অনুযায়ী অটো-ফিল করে। যাদের ইতিমধ্যে এন্ট্রি আছে (admin এর ব্যতিক্রম সহ) তা বদলায় না।"""
-    left = get_left_usernames(mess_id)
-    usernames = [u for u, _ in get_users(mess_id) if u not in left]
+    usernames = [u for u, _ in get_active_users(mess_id)]
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     filled = []
@@ -1627,7 +1673,8 @@ async def finalize_renew(reply_target, context, user_id, old_mess_id, start_date
     # পুরনো মেসের সব সদস্য কপি (ইউজার আইডি সহ)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT username, full_name, user_id FROM users WHERE mess_id = ? AND left_date IS NULL", (old_mess_id,))
+    c.execute("""SELECT username, full_name, user_id FROM users
+                 WHERE mess_id = ? AND left_date IS NULL AND (ended_by IS NULL OR ended_by = 'self')""", (old_mess_id,))
     old_users = c.fetchall()
     conn.close()
     for username, full_name, member_user_id in old_users:
@@ -1763,6 +1810,7 @@ def build_admin_panel(mess_id):
     keyboard = [
         [InlineKeyboardButton("👑 নতুন এডমিন বানান", callback_data=f'promote_user_{mess_id}')],
         [InlineKeyboardButton("👤 এডমিন বাদ দিন", callback_data=f'demote_admin_{mess_id}')],
+        [InlineKeyboardButton("🏁 সদস্যের মেস শেষ করুন", callback_data=f'end_member_list|{mess_id}')],
         [InlineKeyboardButton("🗑️ ইউজার রিমুভ করুন", callback_data=f'remove_user_{mess_id}')],
         [InlineKeyboardButton("🔙 ব্যাক", callback_data=f'back_main_{mess_id}')],
     ]
@@ -1812,9 +1860,18 @@ def build_mess_settings_view(mess_id, user_id):
             callback_data=f'digest_toggle|{mess_id}')])
         text += "\n👥 **সবার জন্য** বন্ধ করলে মেসের কেউই রাতের আপডেট পাবে না (শুধু এডমিন বদলাতে পারে)।\n"
     else:
+        ended_by = get_ended_usernames(mess_id).get(get_member_username(user_id, mess_id))
+        if ended_by:
+            text += "\n🏁 **আপনি মেস শেষ করেছেন** — মেসে আছেন, কিন্তু আপনার নামে নতুন জমা/মিল যোগ হচ্ছে না।\n"
+            if ended_by == 'admin':
+                text += "(এডমিন শেষ করেছেন — চলমান হিসাবের পর আর কোনো হিসাবে থাকবেন না)\n"
+        else:
+            keyboard.append([InlineKeyboardButton("🏁 মেস শেষ করুন", callback_data=f'end_self|{mess_id}')])
+            text += ("\n🏁 **মেস শেষ করলে** আপনি মেসেই থাকবেন, কিন্তু আপনার নামে আর নতুন জমা/মিল যোগ হবে না। "
+                     "রিনিউ হলে আপনি সাথে যাবেন।\n")
         keyboard.append([InlineKeyboardButton("🚪 মেস ছাড়ুন", callback_data=f'leave_mess|{mess_id}')])
-        text += ("\n🚪 **মেস ছাড়লে** আপনি আর এই মেস দেখতে বা আপডেট পাবেন না, তবে আগের জমা ও মিলসহ "
-                 "আপনার হিসাব মেসের হিসাবে থেকে যাবে।\n")
+        text += ("\n🚪 **মেস ছাড়লে** আপনি এই মেস থেকে বের হয়ে যাবেন — আর মেস দেখতে বা আপডেট পাবেন না, "
+                 "তবে আগের জমা ও মিলসহ হিসাব চলমান হিসাবে থেকে যাবে।\n")
 
     keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data='my_accounts_back')])
     return text, InlineKeyboardMarkup(keyboard)
@@ -1955,7 +2012,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ অনুমতি নেই!", show_alert=True)
             return
         mill_date = context.user_data.get('mill_date')
-        usernames = [u for u, _ in get_users(mess_id)]
+        usernames = [u for u, _ in get_active_users(mess_id)]
         presets = get_daily_default_mills(mess_id, usernames)
         bulk_set_mills_for_date(mess_id, mill_date, usernames, presets, {})
         context.user_data['mill_exceptions'] = {}
@@ -2012,7 +2069,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         mill_date = context.user_data.get('mill_date')
         exceptions = context.user_data.get('mill_exceptions', {})
-        usernames = [u for u, _ in get_users(mess_id)]
+        usernames = [u for u, _ in get_active_users(mess_id)]
         presets = get_daily_default_mills(mess_id, usernames)
         bulk_set_mills_for_date(mess_id, mill_date, usernames, presets, exceptions)
         lines = "\n".join(
@@ -2063,6 +2120,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id, mess_id):
             await query.answer("❌ শুধুমাত্র এডমিন ডিপোজিট যোগ করতে পারবেন!", show_alert=True)
             return
+        if username not in [u for u, _ in get_active_users(mess_id)]:
+            await query.answer("❌ এই সদস্যের নামে নতুন জমা যোগ করা যাবে না (মেস শেষ/ছেড়ে গেছে)!", show_alert=True)
+            return
         context.user_data['deposit_user'] = username
         context.user_data['deposit_mess_id'] = mess_id
         context.user_data['action'] = f'deposit_amount_{mess_id}'
@@ -2076,9 +2136,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_mess_completed(mess_id):
             await query.edit_message_text("❌ এই মেস সম্পন্ন হয়েছে! ডিপোজিট করা যাবে না।")
             return
-        users = get_users(mess_id)
+        users = get_active_users(mess_id)
         if not users:
-            await query.edit_message_text("❌ কোনো ইউজার নেই! আগে ইউজার যোগ করুন।")
+            await query.edit_message_text("❌ কোনো সক্রিয় ইউজার নেই! আগে ইউজার যোগ করুন।\n(মেস শেষ করা বা ছেড়ে যাওয়া সদস্যের নামে নতুন জমা যোগ করা যায় না)")
             return
         if len(users) == 1:
             # ব্যক্তিগত/একক-ইউজার মেসে সরাসরি amount জিজ্ঞেস করি, বাছাইয়ের ধাপ বাদ দিয়ে
@@ -2195,6 +2255,109 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = build_mess_settings_view(mess_id, user_id)
         await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
 
+    elif data.startswith('end_self|'):
+        mess_id = int(data.split('|')[1])
+        if is_admin(user_id, mess_id):
+            await query.answer("❌ এডমিন নিজে মেস শেষ করতে পারবেন না!", show_alert=True)
+            return
+        username = get_member_username(user_id, mess_id)
+        if not username or username in get_ended_usernames(mess_id):
+            await query.answer("❌ মেস শেষ করা যাচ্ছে না!", show_alert=True)
+            return
+        label = mess_display_label(get_mess_info(mess_id))
+        keyboard = [
+            [InlineKeyboardButton("✅ হ্যাঁ, মেস শেষ করব", callback_data=f'end_self_confirm|{mess_id}')],
+            [InlineKeyboardButton("❌ না", callback_data=f'mess_settings|{mess_id}')]
+        ]
+        await query.edit_message_text(
+            f"🏁 **{label}** — আপনার মেস শেষ করতে চান?\n\n"
+            "• আপনি মেসেই থাকবেন, আগের জমা-মিল হিসাবে থাকবে\n"
+            "• আপনার নামে আর নতুন জমা/মিল যোগ হবে না\n"
+            "• রিনিউ করলে আপনি সাথে যাবেন",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
+        )
+
+    elif data.startswith('end_self_confirm|'):
+        mess_id = int(data.split('|')[1])
+        username = get_member_username(user_id, mess_id)
+        if not username or is_admin(user_id, mess_id) or not end_member(mess_id, username, 'self'):
+            await query.answer("❌ মেস শেষ করা যায়নি!", show_alert=True)
+            return
+        label = mess_display_label(get_mess_info(mess_id))
+        await query.edit_message_text(
+            f"🏁 আপনি **{label}** শেষ করেছেন।\n\nআপনি মেসে আছেন, কিন্তু আপনার নামে আর নতুন জমা/মিল যোগ হবে না। রিনিউ হলে সাথে যাবেন।",
+            parse_mode='Markdown')
+        for admin_uid, _ in get_admins(mess_id):
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_uid,
+                    text=f"🏁 @{username} {label} শেষ করেছে।\nসে মেসে আছে ও হিসাবে আছে, তবে তার নামে নতুন জমা/মিল যোগ হবে না। রিনিউতে সাথে যাবে।")
+            except Exception:
+                pass
+
+    elif data.startswith('end_member_list|'):
+        mess_id = int(data.split('|')[1])
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ আপনি এডমিন নন!", show_alert=True)
+            return
+        admin_ids = {uid for uid, _ in get_admins(mess_id)}
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT username, user_id FROM users WHERE mess_id = ? AND left_date IS NULL AND ended_date IS NULL", (mess_id,))
+        candidates = [u for u, uid in cur.fetchall() if uid not in admin_ids]
+        conn.close()
+        if not candidates:
+            await query.edit_message_text(
+                "ℹ️ মেস শেষ করার মতো কোনো সক্রিয় সদস্য নেই।",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ব্যাক", callback_data=f'admin_panel_{mess_id}')]]))
+            return
+        keyboard = [[InlineKeyboardButton(f"@{u}", callback_data=f'end_member_ask|{mess_id}|{u}')] for u in candidates]
+        keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data=f'admin_panel_{mess_id}')])
+        await query.edit_message_text(
+            "🏁 **কার মেস শেষ করবেন?**\n\nচলমান হিসাব পর্যন্ত সে থাকবে, কিন্তু আর নতুন জমা/মিল যোগ হবে না এবং রিনিউতে সে যাবে না।",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    elif data.startswith('end_member_ask|'):
+        _, mid_s, uname = data.split('|', 2)
+        mess_id = int(mid_s)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ আপনি এডমিন নন!", show_alert=True)
+            return
+        keyboard = [
+            [InlineKeyboardButton("✅ হ্যাঁ, মেস শেষ করুন", callback_data=f'end_member_do|{mess_id}|{uname}')],
+            [InlineKeyboardButton("❌ না", callback_data=f'end_member_list|{mess_id}')]
+        ]
+        await query.edit_message_text(
+            f"🏁 @{uname} এর মেস শেষ করবেন?\n\n"
+            "• চলমান হিসাব পর্যন্ত সে মেসে ও হিসাবে (মাথাপিছু ভাগ সহ) থাকবে\n"
+            "• তার নামে আর নতুন জমা/মিল যোগ হবে না\n"
+            "• রিনিউ করলে সে নতুন মেসে যাবে না",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith('end_member_do|'):
+        _, mid_s, uname = data.split('|', 2)
+        mess_id = int(mid_s)
+        if not is_admin(user_id, mess_id):
+            await query.answer("❌ আপনি এডমিন নন!", show_alert=True)
+            return
+        if not end_member(mess_id, uname, 'admin'):
+            await query.edit_message_text(f"❌ @{uname} এর মেস শেষ করা যায়নি।")
+            return
+        label = mess_display_label(get_mess_info(mess_id))
+        await query.edit_message_text(f"✅ @{uname} এর মেস শেষ করা হয়েছে।\nচলমান হিসাবে সে থাকবে, রিনিউতে যাবে না।")
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE username = ? AND mess_id = ?", (uname, mess_id))
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            try:
+                await context.bot.send_message(
+                    chat_id=row[0],
+                    text=f"🏁 এডমিন {label} এ আপনার মেস শেষ করেছেন।\nচলমান হিসাব পর্যন্ত আপনি থাকবেন, কিন্তু নতুন জমা/মিল যোগ হবে না এবং রিনিউতে যাবেন না।")
+            except Exception:
+                pass
+
     elif data.startswith('leave_mess|'):
         mess_id = int(data.split('|')[1])
         if is_admin(user_id, mess_id):
@@ -2299,9 +2462,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ কোনো ইউজার নেই!")
             return
         left = get_left_usernames(mess_id)
+        ended = get_ended_usernames(mess_id)
         keyboard = []
         for username, full_name in users:
-            tag = " 🚪 (ছেড়ে গেছে)" if username in left else ""
+            tag = " 🚪 (ছেড়ে গেছে)" if username in left else (" 🏁 (মেস শেষ)" if username in ended else "")
             keyboard.append([InlineKeyboardButton(f"@{username}{tag}", callback_data=f'confirmremove_{mess_id}_{username}')])
         keyboard.append([InlineKeyboardButton("🔙 ব্যাক", callback_data=f'admin_panel_{mess_id}')])
         await query.edit_message_text(
@@ -2555,8 +2719,13 @@ def build_summary_text(mess_id):
     text += "="*30 + "\n\n"
     
     left = get_left_usernames(mess_id)
+    ended = get_ended_usernames(mess_id)
     def _tag(u):
-        return " 🚪" if u in left else ""
+        if u in left:
+            return " 🚪"
+        if u in ended:
+            return " 🏁"
+        return ""
 
     text += "💰 **ডিপোজিটের তালিকা:**\n"
     if users:
@@ -2610,8 +2779,13 @@ def build_summary_text(mess_id):
             else:
                 text += f"  @{username}{_tag(username)}: {diff:.2f} টাকা (দিতে হবে)\n"
 
-    if left:
-        text += "\n\n🚪 = মেস ছেড়ে গেছে, তবে হিসাবে আছে"
+    if left or ended:
+        legend = []
+        if left:
+            legend.append("🚪 = মেস ছেড়ে গেছে")
+        if ended:
+            legend.append("🏁 = মেস শেষ করেছে")
+        text += "\n\n" + ", ".join(legend) + " — তবে চলমান হিসাবে আছে"
 
     return text
 
@@ -2969,9 +3143,9 @@ async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_mess_completed(mess_id):
         await update.message.reply_text("❌ এই মেস সম্পন্ন হয়েছে! ডিপোজিট করা যাবে না।")
         return
-    users = get_users(mess_id)
+    users = get_active_users(mess_id)
     if not users:
-        await update.message.reply_text("❌ কোনো ইউজার নেই! আগে /adduser দিয়ে ইউজার যোগ করুন।")
+        await update.message.reply_text("❌ কোনো সক্রিয় ইউজার নেই! আগে /adduser দিয়ে ইউজার যোগ করুন।\n(মেস শেষ করা বা ছেড়ে যাওয়া সদস্যের নামে নতুন জমা যোগ করা যায় না)")
         return
     if len(users) == 1:
         username = users[0][0]
@@ -3283,8 +3457,8 @@ async def mill_entry_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if is_mess_completed(mess_id):
         await update.message.reply_text("❌ এই মেস সম্পন্ন হয়েছে! মিল এন্ট্রি দেওয়া যাবে না।")
         return
-    if not get_users(mess_id):
-        await update.message.reply_text("❌ কোনো ইউজার নেই! আগে /adduser দিয়ে ইউজার যোগ করুন।")
+    if not get_active_users(mess_id):
+        await update.message.reply_text("❌ কোনো সক্রিয় ইউজার নেই! আগে /adduser দিয়ে ইউজার যোগ করুন।")
         return
     today = bd_now().strftime("%Y-%m-%d")
     keyboard = [
@@ -3312,7 +3486,7 @@ async def start_mill_exception_flow(update_or_query, context, mess_id, mill_date
         await update_or_query.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def show_mill_exception_menu(message_or_query, context, mess_id, edit=True):
-    users = get_users(mess_id)
+    users = get_active_users(mess_id)
     exceptions = context.user_data.get('mill_exceptions', {})
     mill_date = context.user_data.get('mill_date')
     keyboard = []
