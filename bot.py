@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -1575,7 +1576,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = [
-        [InlineKeyboardButton("🆕 নতুন মেস শুরু করুন", callback_data='new_mess')]
+        [InlineKeyboardButton("🆕 নতুন মেস শুরু করুন", callback_data='new_mess')],
+        [InlineKeyboardButton("📥 ব্যাকআপ ফাইল থেকে ইমপোর্ট", callback_data='import_prompt')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -1834,9 +1836,15 @@ def build_myaccounts_view(user_id):
             row.append(InlineKeyboardButton("🗑️", callback_data=f'del_mess|{mess["id"]}'))
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("➕ নতুন মেস", callback_data='new_mess')])
+    keyboard.append([InlineKeyboardButton("📤 এক্সপোর্ট", callback_data='export_all'),
+                     InlineKeyboardButton("📥 ইমপোর্ট", callback_data='import_prompt')])
+    if is_bot_owner(user_id):
+        keyboard.append([InlineKeyboardButton("🗄️ সম্পূর্ণ ব্যাকআপ", callback_data='owner_backup'),
+                         InlineKeyboardButton("♻️ রিস্টোর", callback_data='owner_restore')])
     text = ("📂 **আপনার মেসসমূহ:**\n\n"
             "⚙️ মেস সেটিংস (রাতের আপডেট চালু/বন্ধ, মেস ছাড়া)\n"
-            "🗑️ অপ্রয়োজনীয় মেস স্থায়ীভাবে ডিলিট (শুধু এডমিন)")
+            "🗑️ অপ্রয়োজনীয় মেস স্থায়ীভাবে ডিলিট (শুধু এডমিন)\n"
+            "📤📥 সব মেসের হিসাব এক্সপোর্ট/ইমপোর্ট (ব্যাকআপ)")
     return text, InlineKeyboardMarkup(keyboard)
 
 def build_mess_settings_view(mess_id, user_id):
@@ -1952,6 +1960,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delete_mess(mess_id)
         await query.edit_message_text(f"🗑️ **{label}** স্থায়ীভাবে ডিলিট হয়ে গেছে।\n\nবাকি মেসগুলোর নম্বর নতুন করে সাজানো হয়েছে।", parse_mode='Markdown')
 
+    elif data == 'export_all':
+        await do_user_export(query.message, user_id)
+
+    elif data == 'import_prompt':
+        await start_import_prompt(query.message, context)
+
+    elif data == 'owner_backup':
+        await do_owner_backup(query.message, user_id)
+
+    elif data == 'owner_restore':
+        await start_restore_prompt(query.message, context, user_id)
+
     elif data.startswith('del_mess|'):
         mess_id = int(data.split('|', 1)[1])
         if not is_admin(user_id, mess_id):
@@ -1970,7 +1990,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'my_accounts_back':
         view = build_myaccounts_view(user_id)
         if not view:
-            await query.edit_message_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন।")
+            await query.edit_message_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন, অথবা /import দিয়ে ব্যাকআপ ফাইল থেকে ফিরিয়ে আনুন।")
             return
         text, markup = view
         await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
@@ -3095,7 +3115,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def myaccounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     view = build_myaccounts_view(update.effective_user.id)
     if not view:
-        await update.message.reply_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন।")
+        await update.message.reply_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন, অথবা /import দিয়ে ব্যাকআপ ফাইল থেকে ফিরিয়ে আনুন।")
         return
     text, markup = view
     await update.message.reply_text(text, reply_markup=markup, parse_mode='Markdown')
@@ -3191,7 +3211,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     messes = sort_messes_grouped_by_type(get_user_messes(user_id))
     if not messes:
-        await update.message.reply_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন।")
+        await update.message.reply_text("📭 আপনি কোনো মেসের সাথে যুক্ত নন। /new দিয়ে নতুন শুরু করুন, অথবা /import দিয়ে ব্যাকআপ ফাইল থেকে ফিরিয়ে আনুন।")
         return
     active_mess_id = get_current_mess_id(user_id)
     if len(messes) == 1:
@@ -3602,11 +3622,345 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔚 /endmess — মেস শেষ করুন (এডমিন)\n"
         "💸 /debt_add — ধার-দেনার নতুন এন্ট্রি যোগ করুন (ধার-দেনা মেস)\n"
         "📋 /debt_list — ধার-দেনার সব ব্যক্তির হিসাব দেখুন (ধার-দেনা মেস)\n"
+        "📤 /export — আপনার সব মেসের হিসাব ফাইল হিসেবে এক্সপোর্ট (ব্যাকআপ)\n"
+        "📥 /import — এক্সপোর্ট করা ফাইল থেকে মেসগুলো ফিরিয়ে আনুন (অন্য সার্ভারের বটেও চলে)\n"
+        "🗄️ /backup, ♻️ /restore — পুরো বটের ব্যাকআপ/রিস্টোর (শুধু বট-মালিক, সার্ভার সরানোর জন্য)\n"
+        "🆔 /myid — আপনার টেলিগ্রাম আইডি\n"
         "📖 /guide — বিস্তারিত ব্যবহারবিধি\n"
         "❓ /help — এই সাহায্য বার্তা\n\n"
         "প্রতিটা মেসের নিজস্ব এডমিন থাকে। যে মেস শুরু করে সে-ই সেই মেসের এডমিন।",
         parse_mode='HTML'
     )
+
+# ============ এক্সপোর্ট / ইমপোর্ট (ব্যাকআপ ও অন্য সার্ভারে সরানো) ============
+# দুই ধরনের ফাইল:
+#  • 'user' — যেকোনো ইউজার নিজের সব মেসের হিসাব এক্সপোর্ট করে। এতে কোনো টেলিগ্রাম আইডি থাকে না।
+#             ইমপোর্টে ইমপোর্টকারী সব মেসের এডমিন হয়; সদস্যরা নতুন করে /start দিলেই (একই @username দিয়ে) লিংক হয়ে যায়।
+#  • 'full' — শুধু বট-মালিক (BOT_OWNER_IDS)। পুরো বটের সব মেস, এডমিন, সদস্য-আইডি ও সেটিংস সহ।
+#             অন্য সার্ভারে বট সরানোর জন্য। ইমপোর্ট সবসময় নতুন মেস-আইডি দিয়ে যোগ হয়, কিছু ওভাররাইট হয় না।
+EXPORT_FORMAT = "mess-bot-export"
+EXPORT_VERSION = 1
+EXPORT_TABLES = ['admins', 'users', 'deposits', 'expenses', 'mills', 'meal_presets', 'debt_entries']
+IMPORT_MAX_BYTES = 15 * 1024 * 1024
+IMPORT_MAX_MESSES = 500
+IMPORT_MAX_ROWS = 500000
+
+def get_owner_ids():
+    """বট-মালিকের টেলিগ্রাম আইডি — এনভায়রনমেন্ট ভেরিয়েবল BOT_OWNER_IDS (কমা দিয়ে একাধিক) থেকে"""
+    raw = os.environ.get('BOT_OWNER_IDS') or os.environ.get('BOT_OWNER_ID') or ''
+    ids = set()
+    for part in raw.replace(' ', '').split(','):
+        if part.lstrip('-').isdigit():
+            ids.add(int(part))
+    return ids
+
+def is_bot_owner(user_id):
+    return user_id in get_owner_ids()
+
+class ImportValidationError(Exception):
+    pass
+
+def build_export_payload(mess_ids, full=False):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    messes = []
+    exported_ids = []
+    for mid in sorted(set(mess_ids)):
+        c.execute("SELECT * FROM mess_settings WHERE key = ?", (f'mess_{mid}_info',))
+        row = c.fetchone()
+        if not row:
+            continue
+        info = {k: row[k] for k in row.keys() if k not in ('id', 'key', 'value', 'type_ordinal')}
+        if not full:
+            info.pop('creator_user_id', None)
+        entry = {'orig_id': mid, 'info': info, 'tables': {}, 'settings': {}}
+        for t in EXPORT_TABLES:
+            if t == 'admins' and not full:
+                continue
+            c.execute(f"SELECT * FROM {t} WHERE mess_id = ?", (mid,))
+            rows = []
+            for r in c.fetchall():
+                d = {k: r[k] for k in r.keys() if k != 'id'}
+                if not full:
+                    if t == 'users':
+                        d['user_id'] = None
+                    if t == 'debt_entries':
+                        d['created_by'] = None
+                rows.append(d)
+            entry['tables'][t] = rows
+        c.execute("SELECT value FROM mess_settings WHERE key = ?", (f'digest_enabled_{mid}',))
+        r = c.fetchone()
+        if r and r[0] in ('0', '1'):
+            entry['settings']['digest_enabled'] = r[0]
+        if full:
+            prefix = f'digest_user_off_{mid}_'
+            c.execute("SELECT key, value FROM mess_settings WHERE substr(key, 1, ?) = ?", (len(prefix), prefix))
+            offs = {k[len(prefix):]: v for k, v in c.fetchall() if v == '1'}
+            if offs:
+                entry['settings']['digest_user_off'] = offs
+        messes.append(entry)
+        exported_ids.append(mid)
+    payload = {
+        'format': EXPORT_FORMAT,
+        'version': EXPORT_VERSION,
+        'scope': 'full' if full else 'user',
+        'exported_at': bd_now().strftime("%Y-%m-%d %H:%M"),
+        'messes': messes,
+    }
+    if full:
+        c.execute("SELECT user_id, current_mess_id FROM user_state")
+        payload['user_state'] = [{'user_id': u, 'current_mess_id': m} for u, m in c.fetchall() if m in set(exported_ids)]
+    conn.close()
+    return payload
+
+def _clean_row(row, allowed_cols):
+    """অজানা কলাম বাদ, শুধু সাধারণ ভ্যালু (টেক্সট/সংখ্যা/null) গ্রহণ"""
+    if not isinstance(row, dict):
+        raise ImportValidationError("ফাইলের সারি (row) ভুল ফরম্যাটে আছে")
+    out = {}
+    for k, v in row.items():
+        if k not in allowed_cols:
+            continue
+        if not isinstance(v, (str, int, float, type(None))):
+            raise ImportValidationError("ফাইলে অপ্রত্যাশিত ধরনের ডেটা আছে")
+        if isinstance(v, str) and len(v) > 2000:
+            raise ImportValidationError("ফাইলে অস্বাভাবিক লম্বা লেখা আছে")
+        out[k] = v
+    return out
+
+def import_payload(payload, importer_id, importer_username=None, full=False):
+    """পেলোড ভ্যালিডেট করে সব মেস নতুন আইডি দিয়ে যোগ করে। (new_mess_id, লেবেল) এর তালিকা ফেরত দেয়।
+    কোনো ত্রুটি হলে কিছুই যোগ হয় না (একটাই ট্রানজ্যাকশন)।"""
+    if not isinstance(payload, dict) or payload.get('format') != EXPORT_FORMAT:
+        raise ImportValidationError("এটা এই বটের এক্সপোর্ট ফাইল নয়")
+    if not isinstance(payload.get('version'), int) or payload['version'] > EXPORT_VERSION:
+        raise ImportValidationError("ফাইলের ভার্সন এই বট সাপোর্ট করে না (বটটা আপডেট করুন)")
+    scope = payload.get('scope')
+    if full and scope != 'full':
+        raise ImportValidationError("এটা সম্পূর্ণ ব্যাকআপ ফাইল নয় — সাধারণ /import দিয়ে ইমপোর্ট করুন")
+    if not full and scope != 'user':
+        raise ImportValidationError("এটা সম্পূর্ণ ব্যাকআপ ফাইল — শুধু বট-মালিক /restore দিয়ে ইমপোর্ট করতে পারবেন")
+    messes = payload.get('messes')
+    if not isinstance(messes, list) or not messes:
+        raise ImportValidationError("ফাইলে কোনো মেস নেই")
+    if len(messes) > IMPORT_MAX_MESSES:
+        raise ImportValidationError("ফাইলে অতিরিক্ত বেশি মেস আছে")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        allowed = {}
+        for t in EXPORT_TABLES:
+            c.execute(f"PRAGMA table_info({t})")
+            allowed[t] = {r[1] for r in c.fetchall() if r[1] != 'id'}
+        total_rows = 0
+        id_map = {}
+        pairs = set()
+        new_ids = []
+        for entry in messes:
+            if not isinstance(entry, dict) or not isinstance(entry.get('info'), dict) or not isinstance(entry.get('tables'), dict):
+                raise ImportValidationError("মেসের তথ্য ভুল ফরম্যাটে আছে")
+            info = entry['info']
+            start_date, end_date, month_name = info.get('start_date'), info.get('end_date'), info.get('month_name')
+            if not all(isinstance(x, str) and 0 < len(x) <= 100 for x in (start_date, end_date, month_name)):
+                raise ImportValidationError("মেসের তারিখ/মাসের তথ্য ঠিক নেই")
+            mess_type = info.get('mess_type') or 'simple'
+            if mess_type not in MESS_TYPE_SHORT:
+                raise ImportValidationError("অজানা মেস ধরন")
+            for fld in ('default_mill_count', 'default_breakfast'):
+                if info.get(fld) is not None and not isinstance(info.get(fld), (int, float)):
+                    raise ImportValidationError("মেসের সেটিংয়ে ভুল সংখ্যা আছে")
+            creator = importer_id
+            if full and isinstance(info.get('creator_user_id'), int):
+                creator = info['creator_user_id']
+
+            c.execute("SELECT MAX(CAST(SUBSTR(key, 6, LENGTH(key)-10) AS INTEGER)) FROM mess_settings WHERE key LIKE 'mess_%_info'")
+            new_id = (c.fetchone()[0] or 0) + 1
+            c.execute("""INSERT INTO mess_settings
+                         (key, value, start_date, end_date, month_name, mess_type, default_mill_count, creator_user_id, type_ordinal, default_breakfast)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                      (f'mess_{new_id}_info', f'{start_date}|{end_date}|{month_name}', start_date, end_date, month_name,
+                       mess_type, info.get('default_mill_count') if info.get('default_mill_count') is not None else 1.0,
+                       creator, 0, info.get('default_breakfast') if info.get('default_breakfast') is not None else 1.0))
+            if isinstance(entry.get('orig_id'), int):
+                id_map[entry['orig_id']] = new_id
+            pairs.add((creator, mess_type))
+            new_ids.append(new_id)
+
+            for t in EXPORT_TABLES:
+                rows = entry['tables'].get(t) or []
+                if not isinstance(rows, list):
+                    raise ImportValidationError("মেসের টেবিল-ডেটা ভুল ফরম্যাটে আছে")
+                if t == 'admins' and not full:
+                    continue
+                total_rows += len(rows)
+                if total_rows > IMPORT_MAX_ROWS:
+                    raise ImportValidationError("ফাইলটা অতিরিক্ত বড়")
+                for raw in rows:
+                    row = _clean_row(raw, allowed[t])
+                    row['mess_id'] = new_id
+                    if not full:
+                        if t == 'users':
+                            row['user_id'] = None
+                            if importer_username and str(row.get('username', '')).lower() == importer_username.lower():
+                                row['user_id'] = importer_id
+                        if t == 'debt_entries':
+                            row['created_by'] = importer_id
+                    if full and t in ('admins', 'users', 'debt_entries'):
+                        for fld in ('user_id', 'created_by'):
+                            if fld in row and row[fld] is not None and not isinstance(row[fld], int):
+                                raise ImportValidationError("ফাইলে ভুল আইডি আছে")
+                    cols = list(row.keys())
+                    c.execute(f"INSERT OR IGNORE INTO {t} ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                              [row[k] for k in cols])
+
+            if not full:
+                c.execute("INSERT OR REPLACE INTO admins (user_id, mess_id, username, added_date) VALUES (?, ?, ?, ?)",
+                          (importer_id, new_id, importer_username, bd_now().strftime("%Y-%m-%d %H:%M")))
+
+            settings = entry.get('settings') if isinstance(entry.get('settings'), dict) else {}
+            if settings.get('digest_enabled') in ('0', '1'):
+                c.execute("INSERT OR REPLACE INTO mess_settings (key, value) VALUES (?, ?)",
+                          (f'digest_enabled_{new_id}', settings['digest_enabled']))
+            if full and isinstance(settings.get('digest_user_off'), dict):
+                for uid, val in settings['digest_user_off'].items():
+                    if str(uid).lstrip('-').isdigit() and val == '1':
+                        c.execute("INSERT OR REPLACE INTO mess_settings (key, value) VALUES (?, '1')",
+                                  (f'digest_user_off_{new_id}_{int(uid)}',))
+
+        if full:
+            for st in payload.get('user_state') or []:
+                if isinstance(st, dict) and isinstance(st.get('user_id'), int) and st.get('current_mess_id') in id_map:
+                    c.execute("INSERT OR REPLACE INTO user_state (user_id, current_mess_id) VALUES (?, ?)",
+                              (st['user_id'], id_map[st['current_mess_id']]))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    for creator, mess_type in pairs:
+        renumber_type_ordinals(creator, mess_type)
+    return [(nid, mess_display_label(get_mess_info(nid))) for nid in new_ids]
+
+def _export_filename(prefix):
+    return f"{prefix}_{bd_now().strftime('%Y%m%d_%H%M')}.json"
+
+async def do_user_export(message, user_id):
+    mess_ids = [m['id'] for m in get_user_messes(user_id)]
+    if not mess_ids:
+        await message.reply_text("📭 এক্সপোর্ট করার মতো কোনো মেস নেই।")
+        return
+    payload = build_export_payload(mess_ids, full=False)
+    data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    await message.reply_document(
+        document=io.BytesIO(data), filename=_export_filename("mess_export"),
+        caption=(f"📤 {len(payload['messes'])} টা মেসের হিসাব এক্সপোর্ট হয়েছে।\n\n"
+                 "এই ফাইল নিরাপদে রেখে দিন। যেকোনো সময় /import দিয়ে ফাইলটা পাঠালে সব মেস ফিরে পাবেন "
+                 "(অন্য সার্ভারের বটেও)।"))
+
+async def start_import_prompt(message, context):
+    context.user_data['action'] = 'import_file'
+    await message.reply_text(
+        "📥 **ইমপোর্ট**\n\n"
+        "এক্সপোর্ট করা `.json` ফাইলটা এখন এখানে পাঠান।\n\n"
+        "• প্রতিটা মেস **নতুন মেস হিসেবে** যোগ হবে, আগের কিছু বদলাবে না\n"
+        "• আপনি সবগুলোর এডমিন হবেন\n"
+        "• সদস্যরা বটে /start দিলেই (একই @username দিয়ে) মেসে যুক্ত হয়ে যাবে\n"
+        "• একই মেস আবার ইমপোর্ট করলে কপি তৈরি হবে",
+        parse_mode='Markdown')
+
+async def do_owner_backup(message, user_id):
+    if not get_owner_ids():
+        await message.reply_text(
+            "❌ বট-মালিক সেট করা নেই।\n\n"
+            "১) /myid দিয়ে আপনার আইডি জেনে নিন\n"
+            "২) Coolify-তে এনভায়রনমেন্ট ভেরিয়েবল `BOT_OWNER_IDS` = আপনার আইডি দিন, তারপর redeploy করুন",
+            parse_mode='Markdown')
+        return
+    if not is_bot_owner(user_id):
+        await message.reply_text("❌ শুধুমাত্র বট-মালিক এটা করতে পারবেন।")
+        return
+    ids = [m['id'] for m in get_all_messes()]
+    if not ids:
+        await message.reply_text("📭 বটে কোনো মেস নেই।")
+        return
+    payload = build_export_payload(ids, full=True)
+    data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    await message.reply_document(
+        document=io.BytesIO(data), filename=_export_filename("mess_FULL_backup"),
+        caption=(f"🗄️ সম্পূর্ণ ব্যাকআপ — {len(payload['messes'])} টা মেস (সব ইউজারের)।\n\n"
+                 "⚠️ এতে সবার হিসাব ও টেলিগ্রাম আইডি আছে, তাই কারো সাথে শেয়ার করবেন না।\n"
+                 "নতুন সার্ভারে একই BOT_TOKEN দিয়ে বট চালিয়ে /restore দিয়ে এই ফাইল পাঠান।"))
+
+async def start_restore_prompt(message, context, user_id):
+    if not get_owner_ids():
+        await do_owner_backup(message, user_id)  # একই সেটআপ-নির্দেশনা দেখাবে
+        return
+    if not is_bot_owner(user_id):
+        await message.reply_text("❌ শুধুমাত্র বট-মালিক এটা করতে পারবেন।")
+        return
+    context.user_data['action'] = 'restore_file'
+    await message.reply_text(
+        "♻️ **সম্পূর্ণ রিস্টোর**\n\n"
+        "`mess_FULL_backup_....json` ফাইলটা এখন পাঠান।\n\n"
+        "• সব মেস, এডমিন ও সদস্য আগের মতোই ফিরে আসবে\n"
+        "• নতুন মেস হিসেবে যোগ হয়, আগের কিছু মোছা/বদলানো হয় না\n"
+        "• একই ফাইল দুইবার রিস্টোর করবেন না (কপি তৈরি হবে)",
+        parse_mode='Markdown')
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await do_user_export(update.message, update.effective_user.id)
+
+async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_import_prompt(update.message, context)
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await do_owner_backup(update.message, update.effective_user.id)
+
+async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_restore_prompt(update.message, context, update.effective_user.id)
+
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"🆔 আপনার টেলিগ্রাম আইডি: `{update.effective_user.id}`", parse_mode='Markdown')
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    action = context.user_data.get('action')
+    if action not in ('import_file', 'restore_file'):
+        return
+    user = update.effective_user
+    full = (action == 'restore_file')
+    if full and not is_bot_owner(user.id):
+        context.user_data['action'] = None
+        await update.message.reply_text("❌ শুধুমাত্র বট-মালিক এটা করতে পারবেন।")
+        return
+    doc = update.message.document
+    if doc.file_size and doc.file_size > IMPORT_MAX_BYTES:
+        await update.message.reply_text("❌ ফাইলটা অনেক বড় (সর্বোচ্চ ১৫ MB)।")
+        return
+    try:
+        tg_file = await doc.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+        if len(raw) > IMPORT_MAX_BYTES:
+            raise ImportValidationError("ফাইলটা অনেক বড় (সর্বোচ্চ ১৫ MB)")
+        try:
+            payload = json.loads(raw.decode('utf-8'))
+        except Exception:
+            raise ImportValidationError("ফাইলটা পড়া যায়নি — সঠিক এক্সপোর্ট ফাইল (.json) পাঠান")
+        imported = import_payload(payload, user.id, user.username, full=full)
+    except ImportValidationError as e:
+        await update.message.reply_text(f"❌ ইমপোর্ট হয়নি: {e}\n\nআবার ফাইল পাঠান, অথবা অন্য কিছু করতে যেকোনো কমান্ড দিন।")
+        return
+    except Exception:
+        await update.message.reply_text("❌ ইমপোর্টে সমস্যা হয়েছে, কিছুই যোগ হয়নি। ফাইলটা ঠিক আছে কিনা দেখে আবার চেষ্টা করুন।")
+        return
+    context.user_data['action'] = None
+    lines = "\n".join(f"• {label}" for _, label in imported[:40])
+    more = f"\n… আরও {len(imported) - 40} টা" if len(imported) > 40 else ""
+    await update.message.reply_text(
+        f"✅ {len(imported)} টা মেস ইমপোর্ট হয়েছে:\n\n{lines}{more}\n\n📂 /myaccounts দিয়ে দেখুন।")
 
 # ============ মেইন ফাংশন ============
 async def post_init(application: Application):
@@ -3628,6 +3982,8 @@ async def post_init(application: Application):
         BotCommand("renew", "🔁 আগের মেস থেকে (একই সদস্য) নতুন শুরু"),
         BotCommand("debt_add", "💸 ধার-দেনার এন্ট্রি যোগ করুন"),
         BotCommand("debt_list", "📋 ধার-দেনার হিসাব দেখুন"),
+        BotCommand("export", "📤 সব মেস এক্সপোর্ট (ব্যাকআপ)"),
+        BotCommand("import", "📥 ফাইল থেকে মেস ইমপোর্ট"),
         BotCommand("help", "❓ সাহায্য"),
         BotCommand("guide", "📖 ব্যবহারবিধি")
     ])
@@ -3695,6 +4051,12 @@ def main():
     app.add_handler(CommandHandler("guide", guide_command))
     app.add_handler(CommandHandler("debt_add", debt_add_command))
     app.add_handler(CommandHandler("debt_list", debt_list_command))
+    app.add_handler(CommandHandler("export", export_command))
+    app.add_handler(CommandHandler("import", import_command))
+    app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("restore", restore_command))
+    app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
